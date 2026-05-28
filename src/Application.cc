@@ -17,6 +17,7 @@
 
 #include <qsgrendererinterface.h>
 #include <tinyxml2.h>
+#include <cstdlib>
 #include <queue>
 
 #include <gz/common/Console.hh>
@@ -105,9 +106,21 @@ Application::Application(int &_argc, char **_argv, const WindowType _type,
 #else
   AvailableAPIs api = AvailableAPIs::OpenGL;
 #endif
-  if (_renderEngineGuiApiBackend)
+  // The backend may be selected explicitly (the --render-engine-gui-api-backend
+  // option, passed by gz-sim) or, when unset, via the
+  // GZ_GUI_RENDER_ENGINE_GUI_API_BACKEND environment variable. The env fallback
+  // lets `gz gui -c <config>` (which does not forward the option) pick a backend
+  // -- needed e.g. to drive the Vulkan scene-graph backend for a Vulkan engine.
+  std::string renderEngineGuiApiBackend =
+      _renderEngineGuiApiBackend ? _renderEngineGuiApiBackend : "";
+  if (renderEngineGuiApiBackend.empty())
   {
-    const std::string renderEngineGuiApiBackend = _renderEngineGuiApiBackend;
+    if (const char *envBackend =
+            std::getenv("GZ_GUI_RENDER_ENGINE_GUI_API_BACKEND"))
+      renderEngineGuiApiBackend = envBackend;
+  }
+  if (!renderEngineGuiApiBackend.empty())
+  {
     if (renderEngineGuiApiBackend == "vulkan")
       api = AvailableAPIs::Vulkan;
 #ifdef __APPLE__
@@ -155,6 +168,12 @@ Application::Application(int &_argc, char **_argv, const WindowType _type,
     qputenv("QT_VULKAN_DEVICE_EXTENSIONS",
             "VK_KHR_maintenance2;VK_EXT_shader_subgroup_vote;"
             "VK_EXT_shader_viewport_index_layer;"
+            // Zero-copy interop: let Qt's QRhi device import OPAQUE_FD memory and
+            // semaphores exported by a render engine that owns its own VkDevice
+            // (e.g. the O3DE/Atom backend), so the QSGTexture can alias the
+            // engine's rendered VkImage instead of going through a CPU readback.
+            "VK_KHR_external_memory;VK_KHR_external_memory_fd;"
+            "VK_KHR_external_semaphore;VK_KHR_external_semaphore_fd;"
 #  ifdef GZ_USE_VULKAN_DEBUG_EXT
             ";VK_EXT_debug_marker"
 #  endif
