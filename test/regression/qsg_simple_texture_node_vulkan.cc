@@ -44,18 +44,43 @@
 //   on its own; only when the VkImage was created on (and exported by) a
 //   SECOND VkDevice does the QSGSimpleTextureNode draw render uniform.
 //
-// Test 3 (cross-device, FromNativeRendersImportedFdPattern) -- FOLLOW-UP,
-// not yet implemented:
-//   The decisive bug-reproducer. Stand up a second private VkInstance/
-//   VkDevice, create an OPTIMAL R8G8B8A8_UNORM VkImage with
-//   VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT, a dedicated allocation
-//   (see gz-rendering/o3de/docs/zero-copy-interop-findings.md hypothesis
-//   12-15), populate it via a staging upload there, vkGetMemoryFdKHR, then
-//   import that FD onto Qt's VkDevice with VkMemoryDedicatedAllocateInfo,
-//   wrap via fromNative, and assert the pattern. Expected: FAIL today --
-//   this is the focused harness against which to debug QSGSimpleTextureNode.
-//   The cross-device import helpers live in gz-rendering's O3deVkImport.cc
-//   and can be inlined here once that dependency direction is acceptable.
+// Test 3 (FromNativeRendersImportedFdPattern) -- PASSES today:
+//   The closest possible test-level analog to the production O3DE setup.
+//   A second, private VkInstance/VkDevice stands in for Atom: it creates
+//   an OPTIMAL R8G8B8A8_UNORM VkImage with VK_EXTERNAL_MEMORY_HANDLE_TYPE_
+//   OPAQUE_FD_BIT + dedicated allocation (see gz-rendering/o3de/docs/
+//   zero-copy-interop-findings.md hypotheses 12-15 for why dedicated is
+//   required on NVIDIA), staging-uploads the four-quadrant pattern,
+//   transitions to SHADER_READ_ONLY_OPTIMAL with a QFOT release to
+//   VK_QUEUE_FAMILY_EXTERNAL, and exports the memory FD via
+//   vkGetMemoryFdKHR. Qt's VkDevice imports the FD with VkMemory
+//   DedicatedAllocateInfo (mirroring the producer), QFOT-acquires onto
+//   Qt's queue, and the test wraps the resulting VkImage via fromNative
+//   + QSGSimpleTextureNode. Skips cleanly if VK_KHR_external_memory_fd
+//   isn't available end-to-end.
+//
+//   This test was EXPECTED to fail and reproduce the production bug. It
+//   passes. The pattern shapes display correctly on screen even after a
+//   full cross-device, OPAQUE_FD, OPTIMAL, dedicated-allocation, QFOT
+//   round-trip.
+//
+//   So the bug is NOT in the QSGSimpleTextureNode + fromNative + cross-
+//   device-FD-import path itself. It must be in something the production
+//   O3DE setup adds that this test does not:
+//     * Atom's pipeline leaving the image in some compressed/transient
+//       state different from a clean vkCmdCopyBufferToImage.
+//     * MinimalScene's threading model (render thread + Qt scene-graph
+//       thread + Atom thread) -- this test uses a single QQuickItem with
+//       direct updatePaintNode and no thread handoff.
+//     * Re-import-on-resize churn: production creates and destroys
+//       imported VkImages each window resize (the "retire old imports"
+//       fix kept them alive past Qt's in-flight frame, but the wrong
+//       handle could still be referenced by the QSGSimpleTextureNode).
+//     * Camera->RenderTextureMetalId() pointer stability across frames.
+//   The next focused diagnostic should be on MinimalScene's
+//   TextureNodeRhiVulkan handoff with the GZ_GUI_VULKAN_DIAG prints
+//   enabled, comparing what handle gets passed to fromNative across
+//   frames against what the producer reports.
 
 #include <gtest/gtest.h>
 
@@ -103,6 +128,8 @@
 #include <set>
 #include <utility>
 #include <vector>
+
+#include <unistd.h>  // ::close for the FD cleanup path on import failure
 #endif  // GZ_GUI_TEST_HAVE_VULKAN
 
 #if GZ_GUI_TEST_HAVE_VULKAN
@@ -427,6 +454,424 @@ bool CreateOptimalPatternImage(VkQueue _queue, uint32_t _queueFamily,
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Cross-device FD-import harness (FromNativeRendersImportedFdPattern, Test 3)
+// ---------------------------------------------------------------------------
+// The third test stands up a SECOND, private VkInstance + VkDevice on the same
+// physical GPU as Qt, populates an exportable OPTIMAL VkImage there, exports
+// its memory FD via vkGetMemoryFdKHR, then imports the FD onto Qt's VkDevice
+// and wraps with QSGVulkanTexture::fromNative. This reproduces the cross-
+// device case the production O3DE/Atom zero-copy path uses, isolated from
+// Atom -- the test's "producer" stands in for Atom.
+//
+// All four helpers below mirror what the gz-rendering O3deVkImport.cc /
+// O3deBackend.cc do in production but in test-friendly form:
+//   * SetupProducerDevice    -- private VkInstance + VkDevice (matched to
+//                               Qt's physical device), external_memory_fd
+//                               extension enabled, function pointer cached.
+//   * CreateAndExportImage   -- OPTIMAL VkImage with VkExternalMemoryImage
+//                               CreateInfo + VkMemoryDedicatedAllocateInfo
+//                               + VkExportMemoryAllocateInfo, staging-loaded
+//                               with the pattern, transitioned to SHADER_READ
+//                               with a QFOT release to VK_QUEUE_FAMILY_EXTERNAL,
+//                               FD exported.
+//   * ImportFdOntoQtDevice   -- creates a matching VkImage on Qt's device
+//                               with VkExternalMemoryImageCreateInfo, allocates
+//                               memory with VkImportMemoryFdInfoKHR +
+//                               VkMemoryDedicatedAllocateInfo, binds.
+//   * AcquireOntoQtQueue     -- QFOT acquire from EXTERNAL onto Qt's queue
+//                               family, layout transition to SHADER_READ.
+//
+// Why dedicated allocation: on NVIDIA proprietary, a sub-allocated import of
+// an OPAQUE_FD OPTIMAL image returns the wrong tile-swizzle to the sampler.
+// gz-rendering/o3de/docs/zero-copy-interop-findings.md hypotheses 12-15 cover
+// the bring-up that proved this; the helper attaches the dedicated info on
+// both sides to mirror that fix.
+
+struct ProducerDevice
+{
+  VkInstance instance = VK_NULL_HANDLE;
+  VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+  VkDevice device = VK_NULL_HANDLE;
+  VkQueue queue = VK_NULL_HANDLE;
+  uint32_t queueFamily = UINT32_MAX;
+  PFN_vkGetMemoryFdKHR getMemoryFdKHR = nullptr;
+
+  ~ProducerDevice()
+  {
+    if (this->device != VK_NULL_HANDLE)
+    {
+      vkDeviceWaitIdle(this->device);
+      vkDestroyDevice(this->device, nullptr);
+    }
+    if (this->instance != VK_NULL_HANDLE)
+      vkDestroyInstance(this->instance, nullptr);
+  }
+};
+
+// Tracks the producer-side VkImage / VkDeviceMemory until the test ends, so we
+// can destroy them on the producer device after the consumer has finished
+// sampling. The FD is consumed by Qt's vkAllocateMemory on import.
+struct ProducerImage
+{
+  VkDevice device = VK_NULL_HANDLE;
+  VkImage image = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkDeviceSize allocationSize = 0u;
+
+  ~ProducerImage()
+  {
+    if (this->device != VK_NULL_HANDLE)
+    {
+      if (this->image != VK_NULL_HANDLE)
+        vkDestroyImage(this->device, this->image, nullptr);
+      if (this->memory != VK_NULL_HANDLE)
+        vkFreeMemory(this->device, this->memory, nullptr);
+    }
+  }
+};
+
+// Stand up a private VkInstance + VkDevice on the same physical device as Qt.
+// Picks the first DISCRETE_GPU it finds (mirroring O3deVkInterop.cc); on the
+// single-GPU systems this test was developed on, both VkInstances enumerate
+// the same hardware as the first DISCRETE_GPU, so this matches by construction.
+bool SetupProducerDevice(ProducerDevice *_out)
+{
+  VkApplicationInfo appInfo{};
+  appInfo.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  appInfo.pApplicationName = "qsg_simple_texture_node_vulkan_producer";
+  appInfo.apiVersion = VK_API_VERSION_1_1;
+  VkInstanceCreateInfo instInfo{};
+  instInfo.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  instInfo.pApplicationInfo = &appInfo;
+  if (vkCreateInstance(&instInfo, nullptr, &_out->instance) != VK_SUCCESS)
+    return false;
+
+  uint32_t physCount = 0u;
+  vkEnumeratePhysicalDevices(_out->instance, &physCount, nullptr);
+  if (physCount == 0u)
+    return false;
+  std::vector<VkPhysicalDevice> physs(physCount);
+  vkEnumeratePhysicalDevices(_out->instance, &physCount, physs.data());
+  _out->physicalDevice = physs[0];
+  for (VkPhysicalDevice p : physs)
+  {
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(p, &props);
+    if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+    {
+      _out->physicalDevice = p;
+      break;
+    }
+  }
+
+  uint32_t qfCount = 0u;
+  vkGetPhysicalDeviceQueueFamilyProperties(_out->physicalDevice, &qfCount,
+      nullptr);
+  std::vector<VkQueueFamilyProperties> qfs(qfCount);
+  vkGetPhysicalDeviceQueueFamilyProperties(_out->physicalDevice, &qfCount,
+      qfs.data());
+  for (uint32_t i = 0u; i < qfCount; ++i)
+  {
+    if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+    {
+      _out->queueFamily = i;
+      break;
+    }
+  }
+  if (_out->queueFamily == UINT32_MAX)
+    return false;
+
+  const char *exts[] = {
+      VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
+      VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME};
+  const float prio = 1.0f;
+  VkDeviceQueueCreateInfo queueInfo{};
+  queueInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+  queueInfo.queueFamilyIndex = _out->queueFamily;
+  queueInfo.queueCount = 1u;
+  queueInfo.pQueuePriorities = &prio;
+  VkDeviceCreateInfo devInfo{};
+  devInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+  devInfo.queueCreateInfoCount = 1u;
+  devInfo.pQueueCreateInfos = &queueInfo;
+  devInfo.enabledExtensionCount = 2u;
+  devInfo.ppEnabledExtensionNames = exts;
+  if (vkCreateDevice(_out->physicalDevice, &devInfo, nullptr, &_out->device)
+      != VK_SUCCESS)
+    return false;
+  vkGetDeviceQueue(_out->device, _out->queueFamily, 0u, &_out->queue);
+
+  _out->getMemoryFdKHR = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
+      vkGetDeviceProcAddr(_out->device, "vkGetMemoryFdKHR"));
+  return _out->getMemoryFdKHR != nullptr;
+}
+
+// Create an exportable OPTIMAL VkImage on the producer device, dedicated
+// allocation with OPAQUE_FD export-memory, staging-upload the pattern, then
+// transition the image to SHADER_READ_ONLY_OPTIMAL with a QFOT *release* to
+// VK_QUEUE_FAMILY_EXTERNAL (so the consumer's acquire-from-EXTERNAL matches).
+// Exports the memory FD via vkGetMemoryFdKHR. Returns the dedicated allocation
+// size in *_outAllocSize -- the consumer needs the same size on import.
+bool CreateAndExportImage(const ProducerDevice &_prod,
+    ProducerImage *_outImg, int *_outFd, VkDeviceSize *_outAllocSize)
+{
+  _outImg->device = _prod.device;
+  VkExternalMemoryImageCreateInfo extImg{};
+  extImg.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+  extImg.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+  VkImageCreateInfo imgInfo{};
+  imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  imgInfo.pNext = &extImg;
+  imgInfo.imageType = VK_IMAGE_TYPE_2D;
+  imgInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+  imgInfo.extent = {kPatternW, kPatternH, 1u};
+  imgInfo.mipLevels = 1u;
+  imgInfo.arrayLayers = 1u;
+  imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+  imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+  imgInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateImage(_prod.device, &imgInfo, nullptr, &_outImg->image)
+      != VK_SUCCESS)
+    return false;
+
+  VkMemoryRequirements imgReq{};
+  vkGetImageMemoryRequirements(_prod.device, _outImg->image, &imgReq);
+  const int imgType = FindMemoryType(_prod.physicalDevice,
+      imgReq.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (imgType < 0)
+    return false;
+  VkExportMemoryAllocateInfo exportInfo{};
+  exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+  exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+  VkMemoryDedicatedAllocateInfo dedicated{};
+  dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+  dedicated.image = _outImg->image;
+  dedicated.pNext = &exportInfo;
+  VkMemoryAllocateInfo imgAlloc{};
+  imgAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  imgAlloc.pNext = &dedicated;
+  imgAlloc.allocationSize = imgReq.size;
+  imgAlloc.memoryTypeIndex = static_cast<uint32_t>(imgType);
+  if (vkAllocateMemory(_prod.device, &imgAlloc, nullptr, &_outImg->memory)
+      != VK_SUCCESS)
+    return false;
+  vkBindImageMemory(_prod.device, _outImg->image, _outImg->memory, 0u);
+  _outImg->allocationSize = imgReq.size;
+
+  // Staging upload + layout transitions (UNDEFINED -> TRANSFER_DST -> copy ->
+  // SHADER_READ + QFOT release to EXTERNAL).
+  const VkDeviceSize stagingSize =
+      static_cast<VkDeviceSize>(kPatternW) * kPatternH * 4u;
+  VkBufferCreateInfo bufInfo{};
+  bufInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  bufInfo.size = stagingSize;
+  bufInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  bufInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  VkBuffer staging = VK_NULL_HANDLE;
+  vkCreateBuffer(_prod.device, &bufInfo, nullptr, &staging);
+  VkMemoryRequirements bufReq{};
+  vkGetBufferMemoryRequirements(_prod.device, staging, &bufReq);
+  const int bufType = FindMemoryType(_prod.physicalDevice, bufReq.memoryTypeBits,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  VkDeviceMemory stagingMem = VK_NULL_HANDLE;
+  VkMemoryAllocateInfo bufAlloc{};
+  bufAlloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  bufAlloc.allocationSize = bufReq.size;
+  bufAlloc.memoryTypeIndex = static_cast<uint32_t>(bufType);
+  vkAllocateMemory(_prod.device, &bufAlloc, nullptr, &stagingMem);
+  vkBindBufferMemory(_prod.device, staging, stagingMem, 0u);
+  void *mapped = nullptr;
+  vkMapMemory(_prod.device, stagingMem, 0u, stagingSize, 0u, &mapped);
+  auto *base = static_cast<uint32_t *>(mapped);
+  for (int y = 0; y < kPatternH; ++y)
+    for (int x = 0; x < kPatternW; ++x)
+      base[y * kPatternW + x] = QuadrantColour(x, y);
+  vkUnmapMemory(_prod.device, stagingMem);
+
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandPoolCreateInfo poolInfo{};
+  poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  poolInfo.queueFamilyIndex = _prod.queueFamily;
+  poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  vkCreateCommandPool(_prod.device, &poolInfo, nullptr, &pool);
+  VkCommandBufferAllocateInfo cbAlloc{};
+  cbAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cbAlloc.commandPool = pool;
+  cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbAlloc.commandBufferCount = 1u;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  vkAllocateCommandBuffers(_prod.device, &cbAlloc, &cmd);
+  VkCommandBufferBeginInfo begin{};
+  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &begin);
+
+  auto Barrier = [&](VkImageLayout _old, VkImageLayout _new,
+      VkAccessFlags _srcA, VkAccessFlags _dstA,
+      VkPipelineStageFlags _srcS, VkPipelineStageFlags _dstS,
+      uint32_t _srcQF, uint32_t _dstQF)
+  {
+    VkImageMemoryBarrier b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    b.srcAccessMask = _srcA;
+    b.dstAccessMask = _dstA;
+    b.oldLayout = _old;
+    b.newLayout = _new;
+    b.srcQueueFamilyIndex = _srcQF;
+    b.dstQueueFamilyIndex = _dstQF;
+    b.image = _outImg->image;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+    vkCmdPipelineBarrier(cmd, _srcS, _dstS, 0u, 0u, nullptr, 0u, nullptr,
+        1u, &b);
+  };
+  Barrier(VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      0u, VK_ACCESS_TRANSFER_WRITE_BIT,
+      VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED);
+  VkBufferImageCopy region{};
+  region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 0u, 1u};
+  region.imageExtent = {kPatternW, kPatternH, 1u};
+  vkCmdCopyBufferToImage(cmd, staging, _outImg->image,
+      VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1u, &region);
+  // Combined TRANSFER_DST -> SHADER_READ + QFOT release to EXTERNAL. The
+  // consumer (Qt's queue) issues the matching acquire from EXTERNAL.
+  Barrier(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+      VK_ACCESS_TRANSFER_WRITE_BIT, 0u,
+      VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+      _prod.queueFamily, VK_QUEUE_FAMILY_EXTERNAL);
+  vkEndCommandBuffer(cmd);
+  VkSubmitInfo submit{};
+  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit.commandBufferCount = 1u;
+  submit.pCommandBuffers = &cmd;
+  vkQueueSubmit(_prod.queue, 1u, &submit, VK_NULL_HANDLE);
+  vkQueueWaitIdle(_prod.queue);
+  vkDestroyCommandPool(_prod.device, pool, nullptr);
+  vkDestroyBuffer(_prod.device, staging, nullptr);
+  vkFreeMemory(_prod.device, stagingMem, nullptr);
+
+  // Export the memory FD. The consumer is then responsible for closing it via
+  // vkAllocateMemory consumption on import.
+  VkMemoryGetFdInfoKHR getInfo{};
+  getInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+  getInfo.memory = _outImg->memory;
+  getInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+  if (_prod.getMemoryFdKHR(_prod.device, &getInfo, _outFd) != VK_SUCCESS)
+    return false;
+  *_outAllocSize = imgReq.size;
+  return true;
+}
+
+// Import the producer's exported FD onto Qt's VkDevice as an OPTIMAL VkImage
+// with matching VkImageCreateInfo. The import uses VkMemoryDedicatedAllocate
+// Info on the consumer side to mirror the producer's dedicated allocation
+// (see hypothesis 12-15 in zero-copy-interop-findings.md). On success, the
+// producer's FD is consumed by vkAllocateMemory.
+bool ImportFdOntoQtDevice(const PatternImage &_qt, int _fd,
+    VkDeviceSize _allocSize, VkImage *_outImage, VkDeviceMemory *_outMem)
+{
+  VkExternalMemoryImageCreateInfo extImg{};
+  extImg.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+  extImg.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+  VkImageCreateInfo imgInfo{};
+  imgInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+  imgInfo.pNext = &extImg;
+  imgInfo.imageType = VK_IMAGE_TYPE_2D;
+  imgInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+  imgInfo.extent = {kPatternW, kPatternH, 1u};
+  imgInfo.mipLevels = 1u;
+  imgInfo.arrayLayers = 1u;
+  imgInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+  imgInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+  imgInfo.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+      VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  imgInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  imgInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateImage(_qt.device, &imgInfo, nullptr, _outImage) != VK_SUCCESS)
+    return false;
+
+  VkMemoryRequirements req{};
+  vkGetImageMemoryRequirements(_qt.device, *_outImage, &req);
+  const int memType = FindMemoryType(_qt.physicalDevice, req.memoryTypeBits,
+      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+  if (memType < 0)
+    return false;
+  VkImportMemoryFdInfoKHR importFd{};
+  importFd.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+  importFd.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+  importFd.fd = _fd;
+  VkMemoryDedicatedAllocateInfo dedicated{};
+  dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+  dedicated.image = *_outImage;
+  dedicated.pNext = &importFd;
+  VkMemoryAllocateInfo alloc{};
+  alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  alloc.pNext = &dedicated;
+  // Use the producer's reported dedicated allocation size, not Qt's reported
+  // imgReq.size (which may differ slightly).
+  alloc.allocationSize = _allocSize;
+  alloc.memoryTypeIndex = static_cast<uint32_t>(memType);
+  if (vkAllocateMemory(_qt.device, &alloc, nullptr, _outMem) != VK_SUCCESS)
+    return false;
+  // Dedicated allocation always binds at offset 0.
+  vkBindImageMemory(_qt.device, *_outImage, *_outMem, 0u);
+  return true;
+}
+
+// QFOT acquire from EXTERNAL onto Qt's queue family + layout transition to
+// SHADER_READ_ONLY_OPTIMAL (matching the producer's release layout). Submits
+// to Qt's own queue and vkQueueWaitIdles. The image is now ready for
+// QSGVulkanTexture::fromNative.
+bool AcquireOntoQtQueue(VkQueue _qtQueue, uint32_t _qtQF,
+    const PatternImage &_qt, VkImage _image)
+{
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandPoolCreateInfo poolInfo{};
+  poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+  poolInfo.queueFamilyIndex = _qtQF;
+  poolInfo.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  vkCreateCommandPool(_qt.device, &poolInfo, nullptr, &pool);
+  VkCommandBufferAllocateInfo cbAlloc{};
+  cbAlloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cbAlloc.commandPool = pool;
+  cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbAlloc.commandBufferCount = 1u;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  vkAllocateCommandBuffers(_qt.device, &cbAlloc, &cmd);
+  VkCommandBufferBeginInfo begin{};
+  begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &begin);
+  VkImageMemoryBarrier b{};
+  b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+  b.srcAccessMask = 0u;
+  b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+  b.oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  b.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+  b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+  b.dstQueueFamilyIndex = _qtQF;
+  b.image = _image;
+  b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0u, 1u, 0u, 1u};
+  vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0u, 0u, nullptr, 0u, nullptr,
+      1u, &b);
+  vkEndCommandBuffer(cmd);
+  VkSubmitInfo submit{};
+  submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+  submit.commandBufferCount = 1u;
+  submit.pCommandBuffers = &cmd;
+  const VkResult res = vkQueueSubmit(_qtQueue, 1u, &submit, VK_NULL_HANDLE);
+  vkQueueWaitIdle(_qtQueue);
+  vkDestroyCommandPool(_qt.device, pool, nullptr);
+  return res == VK_SUCCESS;
+}
+
 // Decisive pattern check used by both LINEAR and OPTIMAL tests: each of the
 // four quadrants of the rendered framebuffer must carry its expected pattern
 // colour. A weaker "any non-uniform output" assertion would false-PASS on
@@ -628,6 +1073,120 @@ TEST(QsgSimpleTextureNodeVulkan,
   AssertRenderedPattern(rendered, "OPTIMAL/staging-uploaded");
   view.close();
 }
+
+/////////////////////////////////////////////////
+// Cross-device FD-imported VkImage. A second, private VkInstance/VkDevice
+// stands in for Atom, creates an exportable OPTIMAL VkImage there,
+// staging-uploads the pattern, exports the memory FD; Qt's VkDevice
+// imports the FD with VkMemoryDedicatedAllocateInfo and the test wraps it
+// via fromNative + QSGSimpleTextureNode. This is the configuration the
+// production O3DE/Atom path uses; the only variable removed vs production
+// is "Atom" (replaced by a staging upload) and MinimalScene's threading
+// model (replaced by a direct updatePaintNode in a single QQuickItem).
+//
+// Result: PASSES today. The cross-device round-trip on its own is fine.
+// Combined with Tests 1 and 2's PASSes, this isolates the production bug
+// to either something Atom does differently from a clean staging upload,
+// or MinimalScene's threading/lifetime model -- not the Qt+Vulkan
+// primitives. See the file's header comment for the next investigation
+// targets.
+//
+// Skips cleanly if Qt's device was not created with the
+// VK_KHR_external_memory_fd extension (the patched gz-gui's Application.cc
+// enables it via QT_VULKAN_DEVICE_EXTENSIONS), or if the producer device
+// cannot be brought up.
+TEST(QsgSimpleTextureNodeVulkan,
+    GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRendersImportedFdPattern))
+{
+  QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+  int argc = 1;
+  static char argv0[] = "qsg_simple_texture_node_vulkan_imported_fd";
+  static char *argv[] = {argv0, nullptr};
+  QGuiApplication app(argc, argv);
+
+  QQuickView view;
+  view.setResizeMode(QQuickView::SizeRootObjectToView);
+  view.resize(kPatternW, kPatternH);
+  view.show();
+  QTest::qWaitForWindowExposed(&view);
+  QCoreApplication::processEvents();
+
+  PatternImage qt;
+  ASSERT_TRUE(GetQtVulkanHandles(&view, &qt));
+  QSGRendererInterface *rif = view.rendererInterface();
+  VkQueue qtQueue = *static_cast<VkQueue *>(rif->getResource(&view,
+      QSGRendererInterface::CommandQueueResource));
+  ASSERT_NE(qtQueue, VK_NULL_HANDLE);
+  uint32_t qfCount = 0u;
+  vkGetPhysicalDeviceQueueFamilyProperties(qt.physicalDevice, &qfCount, nullptr);
+  std::vector<VkQueueFamilyProperties> qfs(qfCount);
+  vkGetPhysicalDeviceQueueFamilyProperties(qt.physicalDevice, &qfCount,
+      qfs.data());
+  uint32_t qtQF = UINT32_MAX;
+  for (uint32_t i = 0u; i < qfCount; ++i)
+  {
+    if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+    {
+      qtQF = i;
+      break;
+    }
+  }
+  ASSERT_NE(qtQF, UINT32_MAX);
+
+  ProducerDevice prod;
+  if (!SetupProducerDevice(&prod))
+  {
+    GTEST_SKIP() << "could not bring up the producer VkDevice "
+                    "(VK_KHR_external_memory_fd unavailable on this GPU?)";
+  }
+
+  // Producer side: create exportable image, staging-upload pattern, export FD.
+  ProducerImage prodImg;
+  int fd = -1;
+  VkDeviceSize allocSize = 0u;
+  ASSERT_TRUE(CreateAndExportImage(prod, &prodImg, &fd, &allocSize))
+      << "could not create + export the producer's VkImage / FD";
+  ASSERT_GE(fd, 0);
+
+  // Consumer side: import the FD onto Qt's device, QFOT-acquire onto Qt's
+  // queue. We do NOT plumb the imported VkImage through the PatternImage
+  // RAII holder because Qt's queue / scene graph may still be sampling it
+  // when the test exits; track it separately and free after vkDeviceWaitIdle.
+  VkImage importedImage = VK_NULL_HANDLE;
+  VkDeviceMemory importedMem = VK_NULL_HANDLE;
+  if (!ImportFdOntoQtDevice(qt, fd, allocSize, &importedImage, &importedMem))
+  {
+    ::close(fd);
+    GTEST_SKIP() << "vkAllocateMemory(VkImportMemoryFdInfoKHR) failed -- did "
+                    "Qt enable VK_KHR_external_memory_fd on its VkDevice? "
+                    "(set via QT_VULKAN_DEVICE_EXTENSIONS in the gz-gui app.)";
+  }
+  // The FD is now owned by Qt's vkAllocateMemory; do not close it.
+
+  ASSERT_TRUE(AcquireOntoQtQueue(qtQueue, qtQF, qt, importedImage))
+      << "could not QFOT-acquire the imported image onto Qt's queue";
+
+  // Hand the imported VkImage to the same PatternItem the other two tests
+  // use; the path under test (fromNative + QSGSimpleTextureNode) is now
+  // exercised on a cross-device-imported image.
+  auto *parent = view.contentItem();
+  ASSERT_NE(parent, nullptr);
+  auto *item = new PatternItem(parent, importedImage,
+      QSize(kPatternW, kPatternH));
+  item->setSize(QSizeF(kPatternW, kPatternH));
+  item->setPosition(QPointF(0.0, 0.0));
+
+  view.update();
+  QImage rendered = view.grabWindow();
+  AssertRenderedPattern(rendered, "cross-device FD-imported");
+  view.close();
+
+  // Tear-down: PatternItem (parented to the view) is auto-destroyed; flush
+  // Qt's queue so we can safely free the imported VkImage / VkDeviceMemory.
+  vkDeviceWaitIdle(qt.device);
+  vkDestroyImage(qt.device, importedImage, nullptr);
+  vkFreeMemory(qt.device, importedMem, nullptr);
+}
 #else  // GZ_GUI_TEST_HAVE_VULKAN
 TEST(QsgSimpleTextureNodeVulkan,
     GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRendersLinearPattern))
@@ -637,6 +1196,12 @@ TEST(QsgSimpleTextureNodeVulkan,
 }
 TEST(QsgSimpleTextureNodeVulkan,
     GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRendersOptimalPattern))
+{
+  GTEST_SKIP() << "Qt was built without Vulkan support; "
+                  "QSGVulkanTexture::fromNative is not available.";
+}
+TEST(QsgSimpleTextureNodeVulkan,
+    GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRendersImportedFdPattern))
 {
   GTEST_SKIP() << "Qt was built without Vulkan support; "
                   "QSGVulkanTexture::fromNative is not available.";
