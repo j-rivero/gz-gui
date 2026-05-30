@@ -157,6 +157,10 @@ struct DeviceData
   PFN_vkCmdDispatch CmdDispatch{nullptr};
   PFN_vkCmdDispatchIndirect CmdDispatchIndirect{nullptr};
   PFN_vkCmdDispatchBase CmdDispatchBase{nullptr};
+  PFN_vkCmdDrawIndirect CmdDrawIndirect{nullptr};
+  PFN_vkCmdDrawIndexedIndirect CmdDrawIndexedIndirect{nullptr};
+  PFN_vkCmdDrawIndirectCount CmdDrawIndirectCount{nullptr};
+  PFN_vkCmdDrawIndexedIndirectCount CmdDrawIndexedIndirectCount{nullptr};
   PFN_vkUpdateDescriptorSets UpdateDescriptorSets{nullptr};
 
   VkPhysicalDeviceMemoryProperties memProps{};
@@ -1398,6 +1402,96 @@ VKAPI_ATTR void VKAPI_CALL Layer_CmdDispatchBase(VkCommandBuffer _cb,
     dd->CmdDispatchBase(_cb, _bx, _by, _bz, _gx, _gy, _gz);
 }
 
+// Indirect draw variants. Qt's QRhi-Vulkan in 6.4.2 documents draw/drawIndexed
+// as the only QRhi -> Vulkan draw mapping, but on some configurations QSG
+// batches MAY emit indirect draws (e.g., when the GPU prefers indirect for
+// large batches). Hook them so the trace can't miss any path that adds to a
+// swapchain-targeting render pass.
+VKAPI_ATTR void VKAPI_CALL Layer_CmdDrawIndirect(VkCommandBuffer _cb,
+    VkBuffer _buf, VkDeviceSize _offset, uint32_t _drawCount, uint32_t _stride)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      ++it->second.drawCount;
+      TraceLog("cb=%p   CmdDrawIndirect buf=%p offset=%llu drawCount=%u "
+               "stride=%u",
+          static_cast<void *>(_cb), static_cast<void *>(_buf),
+          static_cast<unsigned long long>(_offset), _drawCount, _stride);
+    }
+  }
+  if (dd != nullptr && dd->CmdDrawIndirect != nullptr)
+    dd->CmdDrawIndirect(_cb, _buf, _offset, _drawCount, _stride);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdDrawIndexedIndirect(VkCommandBuffer _cb,
+    VkBuffer _buf, VkDeviceSize _offset, uint32_t _drawCount, uint32_t _stride)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      ++it->second.drawCount;
+      TraceLog("cb=%p   CmdDrawIndexedIndirect buf=%p offset=%llu drawCount=%u "
+               "stride=%u",
+          static_cast<void *>(_cb), static_cast<void *>(_buf),
+          static_cast<unsigned long long>(_offset), _drawCount, _stride);
+    }
+  }
+  if (dd != nullptr && dd->CmdDrawIndexedIndirect != nullptr)
+    dd->CmdDrawIndexedIndirect(_cb, _buf, _offset, _drawCount, _stride);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdDrawIndirectCount(VkCommandBuffer _cb,
+    VkBuffer _buf, VkDeviceSize _offset, VkBuffer _countBuf,
+    VkDeviceSize _countOffset, uint32_t _maxDrawCount, uint32_t _stride)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      ++it->second.drawCount;
+      TraceLog("cb=%p   CmdDrawIndirectCount buf=%p maxDrawCount=%u",
+          static_cast<void *>(_cb), static_cast<void *>(_buf), _maxDrawCount);
+    }
+  }
+  if (dd != nullptr && dd->CmdDrawIndirectCount != nullptr)
+    dd->CmdDrawIndirectCount(_cb, _buf, _offset, _countBuf, _countOffset,
+        _maxDrawCount, _stride);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdDrawIndexedIndirectCount(
+    VkCommandBuffer _cb, VkBuffer _buf, VkDeviceSize _offset,
+    VkBuffer _countBuf, VkDeviceSize _countOffset, uint32_t _maxDrawCount,
+    uint32_t _stride)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      ++it->second.drawCount;
+      TraceLog("cb=%p   CmdDrawIndexedIndirectCount buf=%p maxDrawCount=%u",
+          static_cast<void *>(_cb), static_cast<void *>(_buf), _maxDrawCount);
+    }
+  }
+  if (dd != nullptr && dd->CmdDrawIndexedIndirectCount != nullptr)
+    dd->CmdDrawIndexedIndirectCount(_cb, _buf, _offset, _countBuf,
+        _countOffset, _maxDrawCount, _stride);
+}
+
 // ---- Descriptor-set image binding tracking ---------------------------------
 // At vkUpdateDescriptorSets time, recognise writes whose descriptorType binds
 // an image (combined image sampler, sampled image, storage image, input
@@ -1579,6 +1673,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice _phys,
   LOAD_DEV(CmdDispatch);
   LOAD_DEV(CmdDispatchIndirect);
   LOAD_DEV(CmdDispatchBase);
+  LOAD_DEV(CmdDrawIndirect);
+  LOAD_DEV(CmdDrawIndexedIndirect);
+  LOAD_DEV(CmdDrawIndirectCount);
+  LOAD_DEV(CmdDrawIndexedIndirectCount);
   LOAD_DEV(UpdateDescriptorSets);
 #undef LOAD_DEV
 
@@ -1749,6 +1847,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_GetDeviceProcAddr(
   INTERCEPT(CmdDispatch);
   INTERCEPT(CmdDispatchIndirect);
   INTERCEPT(CmdDispatchBase);
+  INTERCEPT(CmdDrawIndirect);
+  INTERCEPT(CmdDrawIndexedIndirect);
+  INTERCEPT(CmdDrawIndirectCount);
+  INTERCEPT(CmdDrawIndexedIndirectCount);
   INTERCEPT(UpdateDescriptorSets);
   // vkCmdCopyImageToBuffer needs special handling: the dump submit calls
   // dd->CmdCopyImageToBuffer (the next-layer pointer) directly, but we DO
