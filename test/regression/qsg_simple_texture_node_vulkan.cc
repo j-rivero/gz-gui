@@ -46,17 +46,19 @@
 //
 // IMPORTANT CAVEAT (recorded 2026-05-30): Tests 1-4 all PASS but their
 // assertion is on QQuickWindow::grabWindow() output, not on the actual
-// swapchain presentation. A subsequent Xvfb screen capture of the live
-// O3DE demo confirmed the production symptom (uniform 148 = Atom's
-// background-clear colour), while the same demo's consumer-side dumps
-// (transfer-copy + sampler probe) show the producer's correct shapes.
-// An Xvfb capture of Test 3's passing run shows a pure 64x64 white block
-// where the pattern should be. So grabWindow() and the presented framebuffer
-// diverge -- the QSGSimpleTextureNode draw apparently goes through one path
-// for grabWindow's readback and another for swapchain present, and the
-// production bug lives on the latter. A follow-up test variant needs to
-// verify against an on-screen capture (e.g. Xvfb root grab) rather than
-// grabWindow(), to actually exercise the failing path.
+// swapchain presentation. The two diverge: the production O3DE demo shows
+// uniform 148 (Atom's background-clear colour) on screen while the same
+// demo's consumer-side dumps (transfer-copy + sampler probe) show the
+// producer's correct shapes, and grabWindow() of the test's view reads the
+// pattern correctly even when the swapchain present is uniform white.
+//
+// Test 5 (FromNativeSwapchainPresentsPattern) closes this gap: it loads an
+// in-tree Vulkan layer (test/regression/swapchain_dump_layer/) that hooks
+// vkQueuePresentKHR, dumps the about-to-be-presented swapchain image to a
+// PPM, and asserts on the PPM. Test 5 currently FAILS on NVIDIA proprietary
+// driver 580 + Qt 6 with a uniform-white swapchain -- the clean isolated
+// reproduction of the production bug. The Atom/o3de/cross-device path was
+// a red herring: the bug exists with pure Qt, single device, single frame.
 //
 // Test 3 (FromNativeRendersImportedFdPattern) -- PASSES today:
 //   The closest possible test-level analog to the production O3DE setup.
@@ -138,8 +140,12 @@
 #include <QSize>
 #include <QtTest/QtTest>
 
-#include <cstdlib>  // std::abs for the pattern-colour tolerance check
+#include <chrono>   // steady_clock + wall-clock deadline for Test 5
+#include <cstdio>   // PPM reader for Test 5: std::FILE / std::fopen / std::fread
+#include <cstdlib>  // std::abs for the pattern-colour tolerance check; ::setenv
+#include <cstring>  // std::strcmp for Test 5 platform-detect
 #include <set>
+#include <string>   // PPM path strings for Test 5
 #include <utility>
 #include <vector>
 
@@ -1261,8 +1267,9 @@ TEST(QsgSimpleTextureNodeVulkan,
 // Result: PASSES (against grabWindow()), so the rapid-wrapper-replacement
 // is harmless to grabWindow's readback path -- but see the file-header
 // caveat: the bug is on the swapchain-present path, which grabWindow()
-// does not exercise. A future variant should verify against Xvfb-root
-// capture instead.
+// does not exercise. See Test 5 (FromNativeSwapchainPresentsPattern)
+// which asserts on the actual swapchain via VK_LAYER_GZ_swapchain_dump
+// and reproduces the production bug in isolation (uniform white fill).
 TEST(QsgSimpleTextureNodeVulkan,
     GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRecreatedEveryFrame))
 {
@@ -1322,6 +1329,208 @@ TEST(QsgSimpleTextureNodeVulkan,
   AssertRenderedPattern(rendered, "OPTIMAL/fromNative-recreated-every-frame");
   view.close();
 }
+
+/////////////////////////////////////////////////
+// Test 5: assert against what the WSI swapchain actually presents.
+//
+// Tests 1-4 all assert against QQuickWindow::grabWindow(), which a layered
+// diagnostic in the live demo proved DIVERGES from the swapchain present
+// path (grabWindow's QImage shows the expected pattern while an on-screen
+// capture of the swapchain shows uniform Atom-clear grey for the *same*
+// VkImage). To exercise the failing path, this test loads a tiny in-tree
+// Vulkan layer (VK_LAYER_GZ_swapchain_dump, built next to this test) that
+// hooks vkQueuePresentKHR, copies the swapchain image to a host buffer just
+// before present, and writes a PPM. The test then asserts on the PPM.
+//
+// **Current result on NVIDIA proprietary driver 580 + Qt 6: FAILS** with a
+// uniform-fill swapchain (every pixel = 0xffffffff / white, with the test's
+// default QQuickWindow clear; in production the same failure shows up as
+// uniform 148 = Atom's clear colour). This is a **clean isolated repro of
+// the production bug**: single-device, single-process, no Atom, no cross-
+// device imports, no producer/consumer threading. The only ingredients are
+// QSGVulkanTexture::fromNative + QSGSimpleTextureNode wrapping a VkImage on
+// Qt's own VkDevice (the same texture data Test 2 proves Qt reads back
+// correctly via grabWindow). So the bug lives in Qt's QSG/QRhi draw of the
+// fromNative texture into the swapchain, NOT in any of the suspects we'd
+// previously chased through Atom/interop.
+//
+// The test is left ENABLED so the failure is visible. When the underlying
+// Qt bug is fixed, this test flips green automatically; do NOT delete or
+// disable it. CI on a headless QPA skips cleanly (see skip predicate below).
+//
+// Skips when:
+//   * GZ_SWAPCHAIN_DUMP_LAYER_DIR not defined at build time (the layer was
+//     not built -- Vulkan was missing);
+//   * QT_QPA_PLATFORM is "offscreen" or no $DISPLAY / $WAYLAND_DISPLAY is set
+//     (WSI swapchain requires a real window-system display);
+//   * the layer dump file does not appear within a generous deadline.
+
+namespace
+{
+// Minimal PPM P6 reader. Returns RGB888 QImage. Used by Test 5 to slurp the
+// layer's swapchain dump back in and run the same 4-quadrant assertion as
+// the grabWindow tests.
+QImage LoadPpmAsQImage(const std::string &_path)
+{
+  std::FILE *f = std::fopen(_path.c_str(), "rb");
+  if (f == nullptr)
+    return {};
+  char magic[3] = {0, 0, 0};
+  if (std::fread(magic, 1u, 2u, f) != 2u || magic[0] != 'P' || magic[1] != '6')
+  {
+    std::fclose(f);
+    return {};
+  }
+  int w = 0, h = 0, maxv = 0;
+  if (std::fscanf(f, " %d %d %d", &w, &h, &maxv) != 3 || maxv != 255 ||
+      w <= 0 || h <= 0)
+  {
+    std::fclose(f);
+    return {};
+  }
+  // One whitespace separates the header from the binary blob.
+  std::fgetc(f);
+  QImage img(w, h, QImage::Format_RGB888);
+  for (int y = 0; y < h; ++y)
+  {
+    if (std::fread(img.scanLine(y), 1u, static_cast<std::size_t>(w) * 3u, f) !=
+        static_cast<std::size_t>(w) * 3u)
+    {
+      std::fclose(f);
+      return {};
+    }
+  }
+  std::fclose(f);
+  return img;
+}
+}  // namespace
+
+TEST(QsgSimpleTextureNodeVulkan,
+    GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeSwapchainPresentsPattern))
+{
+#ifndef GZ_SWAPCHAIN_DUMP_LAYER_DIR
+  GTEST_SKIP() << "VK_LAYER_GZ_swapchain_dump was not built -- Vulkan was "
+                  "not found at CMake configure time. The swapchain-present "
+                  "assertion requires the layer.";
+#else
+  // WSI swapchain creation requires a real window-system display. Skip on
+  // offscreen / headless configurations.
+  const char *qtPlatform = std::getenv("QT_QPA_PLATFORM");
+  const bool isOffscreen = qtPlatform != nullptr
+      && std::strcmp(qtPlatform, "offscreen") == 0;
+  const bool hasDisplay = std::getenv("DISPLAY") != nullptr ||
+      std::getenv("WAYLAND_DISPLAY") != nullptr;
+  if (isOffscreen || !hasDisplay)
+  {
+    GTEST_SKIP() << "no real display ($DISPLAY/$WAYLAND_DISPLAY unset or "
+                    "QT_QPA_PLATFORM=offscreen); WSI swapchain unavailable, "
+                    "so vkQueuePresentKHR will not fire and the layer "
+                    "produces no dump.";
+  }
+
+  // The layer is .so + .json living together in this build dir.
+  const std::string layerDir = GZ_SWAPCHAIN_DUMP_LAYER_DIR;
+  // The dump path is per-test to avoid stomping on a parallel run.
+  const std::string dumpPrefix =
+      "/tmp/qsg_simple_texture_node_vulkan_test5_swapchain";
+  // Wipe any previous-run artifacts so we can later prove this run produced
+  // the file we read back.
+  std::remove((dumpPrefix + ".frame_0000.ppm").c_str());
+  std::remove((dumpPrefix + ".frame_0000.txt").c_str());
+
+  // The Vulkan loader honours these env vars at vkCreateInstance time, so
+  // they MUST be set before QGuiApplication's QVulkanInstance is created
+  // (which happens during QQuickWindow::setGraphicsApi(Vulkan) at the latest
+  // QML scene-graph init).
+  ::setenv("VK_LAYER_PATH", layerDir.c_str(), 1);
+  ::setenv("VK_INSTANCE_LAYERS", "VK_LAYER_GZ_swapchain_dump", 1);
+  ::setenv("GZ_SWAPCHAIN_DUMP_PATH", dumpPrefix.c_str(), 1);
+  ::setenv("GZ_SWAPCHAIN_DUMP_MAX_FRAMES", "1", 1);
+
+  QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+  int argc = 1;
+  static char argv0[] = "qsg_simple_texture_node_vulkan_swapchain_present";
+  static char *argv[] = {argv0, nullptr};
+  QGuiApplication app(argc, argv);
+
+  QQuickView view;
+  view.setResizeMode(QQuickView::SizeRootObjectToView);
+  view.resize(kPatternW, kPatternH);
+  view.show();
+  QTest::qWaitForWindowExposed(&view);
+  QCoreApplication::processEvents();
+
+  PatternImage pi;
+  ASSERT_TRUE(GetQtVulkanHandles(&view, &pi));
+  QSGRendererInterface *rif = view.rendererInterface();
+  VkQueue queue = *static_cast<VkQueue *>(rif->getResource(&view,
+      QSGRendererInterface::CommandQueueResource));
+  ASSERT_NE(queue, VK_NULL_HANDLE);
+  uint32_t qfCount = 0u;
+  vkGetPhysicalDeviceQueueFamilyProperties(pi.physicalDevice, &qfCount,
+      nullptr);
+  std::vector<VkQueueFamilyProperties> qfs(qfCount);
+  vkGetPhysicalDeviceQueueFamilyProperties(pi.physicalDevice, &qfCount,
+      qfs.data());
+  uint32_t queueFamily = UINT32_MAX;
+  for (uint32_t i = 0u; i < qfCount; ++i)
+  {
+    if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+    {
+      queueFamily = i;
+      break;
+    }
+  }
+  ASSERT_NE(queueFamily, UINT32_MAX);
+  ASSERT_TRUE(CreateOptimalPatternImage(queue, queueFamily, &pi));
+
+  // Same setup as Test 2 (single-device OPTIMAL + staging upload).
+  auto *parent = view.contentItem();
+  ASSERT_NE(parent, nullptr);
+  auto *item = new PatternItem(parent, pi.image,
+      QSize(kPatternW, kPatternH));
+  item->setSize(QSizeF(kPatternW, kPatternH));
+  item->setPosition(QPointF(0.0, 0.0));
+
+  // Pump frames until the layer has written the dump file. Bounded by a
+  // generous wall-clock deadline (5s); a working layer typically writes the
+  // first frame in <100ms after exposure.
+  const std::string dumpPath = dumpPrefix + ".frame_0000.ppm";
+  const auto deadline = std::chrono::steady_clock::now()
+      + std::chrono::seconds(5);
+  while (std::chrono::steady_clock::now() < deadline)
+  {
+    view.update();
+    QCoreApplication::processEvents();
+    QTest::qWait(50);  // give Qt's render thread a chance to present
+    std::FILE *probe = std::fopen(dumpPath.c_str(), "rb");
+    if (probe != nullptr)
+    {
+      std::fclose(probe);
+      break;
+    }
+  }
+
+  std::FILE *probe = std::fopen(dumpPath.c_str(), "rb");
+  if (probe == nullptr)
+  {
+    view.close();
+    FAIL() << "VK_LAYER_GZ_swapchain_dump did not produce a PPM at "
+           << dumpPath << " within 5 s. Likely causes: the platform's Qt "
+              "QPA does not route through the layer-instrumented loader; "
+              "Qt's QVulkanInstance was created before VK_LAYER_PATH was "
+              "honoured; or vkQueuePresentKHR is never called (no WSI). "
+              "Run with GZ_SWAPCHAIN_DUMP_VERBOSE=1 for layer-side logs.";
+  }
+  std::fclose(probe);
+
+  QImage presented = LoadPpmAsQImage(dumpPath);
+  ASSERT_FALSE(presented.isNull())
+      << "could not parse swapchain dump PPM at " << dumpPath;
+  AssertRenderedPattern(presented, "swapchain-present (layer-dump)");
+  view.close();
+#endif  // GZ_SWAPCHAIN_DUMP_LAYER_DIR
+}
 #else  // GZ_GUI_TEST_HAVE_VULKAN
 TEST(QsgSimpleTextureNodeVulkan,
     GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRendersLinearPattern))
@@ -1343,6 +1552,12 @@ TEST(QsgSimpleTextureNodeVulkan,
 }
 TEST(QsgSimpleTextureNodeVulkan,
     GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRecreatedEveryFrame))
+{
+  GTEST_SKIP() << "Qt was built without Vulkan support; "
+                  "QSGVulkanTexture::fromNative is not available.";
+}
+TEST(QsgSimpleTextureNodeVulkan,
+    GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeSwapchainPresentsPattern))
 {
   GTEST_SKIP() << "Qt was built without Vulkan support; "
                   "QSGVulkanTexture::fromNative is not available.";

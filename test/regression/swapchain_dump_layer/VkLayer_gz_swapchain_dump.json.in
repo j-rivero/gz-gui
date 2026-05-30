@@ -1,0 +1,11 @@
+{
+    "file_format_version": "1.2.0",
+    "layer": {
+        "name": "VK_LAYER_GZ_swapchain_dump",
+        "type": "GLOBAL",
+        "library_path": "@LAYER_LIBRARY_PATH@",
+        "api_version": "1.2.0",
+        "implementation_version": "1",
+        "description": "gz-gui regression-test layer: dumps the swapchain image just before vkQueuePresentKHR to PPM. Controlled by GZ_SWAPCHAIN_DUMP_PATH (path prefix; layer appends '.frame_NNNN.ppm') and GZ_SWAPCHAIN_DUMP_MAX_FRAMES (default 1)."
+    }
+}
