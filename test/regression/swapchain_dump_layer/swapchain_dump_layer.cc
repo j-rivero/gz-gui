@@ -153,6 +153,7 @@ struct DeviceData
   PFN_vkCmdCopyImage CmdCopyImage{nullptr};
   PFN_vkCmdBlitImage CmdBlitImage{nullptr};
   PFN_vkCmdResolveImage CmdResolveImage{nullptr};
+  PFN_vkUpdateDescriptorSets UpdateDescriptorSets{nullptr};
 
   VkPhysicalDeviceMemoryProperties memProps{};
 
@@ -196,6 +197,18 @@ std::unordered_map<VkCommandBuffer, CmdBufState> gCmdBufStates;
 std::unordered_map<void *, InstanceData *> gInstanceMap;
 std::unordered_map<void *, DeviceData *> gDeviceMap;
 std::unordered_map<VkSwapchainKHR, SwapchainData *> gSwapchainMap;
+
+// Per-VkDescriptorSet recorded image bindings. Keyed by set; value maps
+// binding-index to the (view, layout) most recently written. Used to log
+// which image a fullscreen-triangle composite is sampling.
+struct DescriptorImageBinding
+{
+  VkImageView view{VK_NULL_HANDLE};
+  VkImageLayout layout{VK_IMAGE_LAYOUT_UNDEFINED};
+  uint32_t descriptorType{0u};
+};
+std::unordered_map<VkDescriptorSet,
+    std::unordered_map<uint32_t, DescriptorImageBinding>> gDescriptorImageMap;
 
 bool DrawTraceEnabled()
 {
@@ -1022,6 +1035,34 @@ VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(VkCommandBuffer _cb,
       TraceLog("cb=%p   BindDescriptorSets first=%u count=%u set0=%p",
           static_cast<void *>(_cb), _firstSet, _setCount,
           _setCount > 0u ? static_cast<void *>(_pSets[0]) : nullptr);
+      // Expand each set's recorded image bindings so we can identify the
+      // image the swapchain-targeting composite is sampling.
+      for (uint32_t s = 0u; s < _setCount; ++s)
+      {
+        VkDescriptorSet set = _pSets[s];
+        auto sit = gDescriptorImageMap.find(set);
+        if (sit == gDescriptorImageMap.end())
+          continue;
+        for (const auto &kv : sit->second)
+        {
+          const DescriptorImageBinding &b = kv.second;
+          const uint32_t binding = kv.first / 1024u;
+          const uint32_t elem = kv.first % 1024u;
+          VkImage img = VK_NULL_HANDLE;
+          auto vit = gViewToImage.find(b.view);
+          if (vit != gViewToImage.end())
+            img = vit->second;
+          const char *imgTag = (img != VK_NULL_HANDLE && ImageIsSwapchain(img))
+              ? "SWAPCHAIN" : "non-swapchain";
+          TraceLog("cb=%p     set[%u]=%p binding=%u elem=%u type=%u "
+                   "view=%p image=%p[%s] layout=%d",
+              static_cast<void *>(_cb), _firstSet + s,
+              static_cast<void *>(set), binding, elem,
+              b.descriptorType, static_cast<void *>(b.view),
+              static_cast<void *>(img), imgTag,
+              static_cast<int>(b.layout));
+        }
+      }
     }
   }
   if (dd != nullptr && dd->CmdBindDescriptorSets != nullptr)
@@ -1251,6 +1292,62 @@ VKAPI_ATTR void VKAPI_CALL Layer_CmdResolveImage(VkCommandBuffer _cb,
         _pRegions);
 }
 
+// ---- Descriptor-set image binding tracking ---------------------------------
+// At vkUpdateDescriptorSets time, recognise writes whose descriptorType binds
+// an image (combined image sampler, sampled image, storage image, input
+// attachment) and record (set, binding) -> (view, layout). Then at
+// vkCmdBindDescriptorSets time we can log, for each bound set, which actual
+// images it carries -- so the swapchain-targeting fullscreen-triangle pass
+// tells us which texture it samples.
+
+bool DescriptorTypeIsImage(VkDescriptorType _t)
+{
+  switch (_t)
+  {
+    case VK_DESCRIPTOR_TYPE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+    case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_UpdateDescriptorSets(VkDevice _device,
+    uint32_t _writeCount, const VkWriteDescriptorSet *_pWrites,
+    uint32_t _copyCount, const VkCopyDescriptorSet *_pCopies)
+{
+  DeviceData *dd = GetDevice(_device);
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    for (uint32_t i = 0u; i < _writeCount; ++i)
+    {
+      const VkWriteDescriptorSet &w = _pWrites[i];
+      if (!DescriptorTypeIsImage(w.descriptorType) || w.pImageInfo == nullptr)
+        continue;
+      auto &bindings = gDescriptorImageMap[w.dstSet];
+      // Record each array element starting at dstArrayElement under the
+      // sequential binding-element key (binding * 1024 + arrayElement) so
+      // multi-element image arrays remain distinguishable.
+      for (uint32_t j = 0u; j < w.descriptorCount; ++j)
+      {
+        DescriptorImageBinding b;
+        b.view = w.pImageInfo[j].imageView;
+        b.layout = w.pImageInfo[j].imageLayout;
+        b.descriptorType = static_cast<uint32_t>(w.descriptorType);
+        const uint32_t key = w.dstBinding * 1024u + w.dstArrayElement + j;
+        bindings[key] = b;
+      }
+    }
+  }
+  if (dd != nullptr && dd->UpdateDescriptorSets != nullptr)
+    dd->UpdateDescriptorSets(_device, _writeCount, _pWrites, _copyCount,
+        _pCopies);
+}
+
 VKAPI_ATTR void VKAPI_CALL Layer_CmdCopyImageToBufferTrace(VkCommandBuffer _cb,
     VkImage _src, VkImageLayout _srcLayout, VkBuffer _dst, uint32_t _regions,
     const VkBufferImageCopy *_pRegions)
@@ -1372,6 +1469,7 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice _phys,
   LOAD_DEV(CmdCopyImage);
   LOAD_DEV(CmdBlitImage);
   LOAD_DEV(CmdResolveImage);
+  LOAD_DEV(UpdateDescriptorSets);
 #undef LOAD_DEV
 
   if (id->GetPhysicalDeviceMemoryProperties != nullptr)
@@ -1537,6 +1635,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_GetDeviceProcAddr(
   INTERCEPT(CmdCopyImage);
   INTERCEPT(CmdBlitImage);
   INTERCEPT(CmdResolveImage);
+  INTERCEPT(UpdateDescriptorSets);
   // vkCmdCopyImageToBuffer needs special handling: the dump submit calls
   // dd->CmdCopyImageToBuffer (the next-layer pointer) directly, but we DO
   // want application calls to land in our trace hook. Map the public symbol
