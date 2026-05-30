@@ -133,6 +133,27 @@ struct DeviceData
   PFN_vkResetFences ResetFences{nullptr};
   PFN_vkQueueSubmit QueueSubmit{nullptr};
 
+  // Draw-trace entry points (loaded lazily; not required for the dump path).
+  PFN_vkCreateImageView CreateImageView{nullptr};
+  PFN_vkDestroyImageView DestroyImageView{nullptr};
+  PFN_vkCreateFramebuffer CreateFramebuffer{nullptr};
+  PFN_vkDestroyFramebuffer DestroyFramebuffer{nullptr};
+  PFN_vkCmdBeginRenderPass CmdBeginRenderPass{nullptr};
+  PFN_vkCmdEndRenderPass CmdEndRenderPass{nullptr};
+  PFN_vkCmdBeginRenderPass2 CmdBeginRenderPass2{nullptr};
+  PFN_vkCmdEndRenderPass2 CmdEndRenderPass2{nullptr};
+  PFN_vkCmdBindPipeline CmdBindPipeline{nullptr};
+  PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets{nullptr};
+  PFN_vkCmdDraw CmdDraw{nullptr};
+  PFN_vkCmdDrawIndexed CmdDrawIndexed{nullptr};
+  PFN_vkCmdClearAttachments CmdClearAttachments{nullptr};
+  PFN_vkCmdClearColorImage CmdClearColorImage{nullptr};
+  PFN_vkCmdBeginRendering CmdBeginRendering{nullptr};
+  PFN_vkCmdEndRendering CmdEndRendering{nullptr};
+  PFN_vkCmdCopyImage CmdCopyImage{nullptr};
+  PFN_vkCmdBlitImage CmdBlitImage{nullptr};
+  PFN_vkCmdResolveImage CmdResolveImage{nullptr};
+
   VkPhysicalDeviceMemoryProperties memProps{};
 
   // Per-device command pool created lazily on first present. Indexed by queue
@@ -148,9 +169,54 @@ struct SwapchainData
   std::vector<VkImage> images;
 };
 
+// Per-VkFramebuffer: which images it attaches. Used to detect whether a
+// vkCmdBeginRenderPass targets a swapchain image.
+struct FramebufferData
+{
+  std::vector<VkImageView> views;
+  std::vector<VkImage> images;  // resolved from views via vkCreateImageView
+};
+
+// Per-VkImageView -> source VkImage. Filled at vkCreateImageView time.
+std::unordered_map<VkImageView, VkImage> gViewToImage;
+std::unordered_map<VkFramebuffer, FramebufferData> gFramebuffers;
+
+// Per-VkCommandBuffer state: are we currently inside a renderpass that
+// targets one of our swapchain images? How many draws have we seen?
+struct CmdBufState
+{
+  bool inSwapchainPass{false};
+  uint32_t drawCount{0u};
+  uint32_t clearCount{0u};
+  uint32_t bindPipelineCount{0u};
+  uint32_t bindDescriptorSetsCount{0u};
+};
+std::unordered_map<VkCommandBuffer, CmdBufState> gCmdBufStates;
+
 std::unordered_map<void *, InstanceData *> gInstanceMap;
 std::unordered_map<void *, DeviceData *> gDeviceMap;
 std::unordered_map<VkSwapchainKHR, SwapchainData *> gSwapchainMap;
+
+bool DrawTraceEnabled()
+{
+  static const bool enabled =
+      std::getenv("GZ_SWAPCHAIN_DRAW_TRACE") != nullptr;
+  return enabled;
+}
+
+bool ImageIsSwapchain(VkImage _img)
+{
+  // gMutex held by caller.
+  for (auto &kv : gSwapchainMap)
+  {
+    for (VkImage img : kv.second->images)
+    {
+      if (img == _img)
+        return true;
+    }
+  }
+  return false;
+}
 
 // Vulkan layer dispatch keys. The loader stores a pointer to the dispatch
 // table as the first member of every dispatchable handle (VkInstance,
@@ -707,6 +773,498 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_GetSwapchainImagesKHR(VkDevice _device,
 }
 
 // ---------------------------------------------------------------------------
+// Draw-call trace hooks (GZ_SWAPCHAIN_DRAW_TRACE=1)
+// ---------------------------------------------------------------------------
+
+void TraceLog(const char *_fmt, ...)
+{
+  if (!DrawTraceEnabled())
+    return;
+  std::fprintf(stderr, "[VK_LAYER_GZ_swapchain_dump:trace] ");
+  std::va_list ap;
+  va_start(ap, _fmt);
+  std::vfprintf(stderr, _fmt, ap);
+  va_end(ap);
+  std::fputc('\n', stderr);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateImageView(VkDevice _device,
+    const VkImageViewCreateInfo *_pCreate,
+    const VkAllocationCallbacks *_pAlloc, VkImageView *_pView)
+{
+  DeviceData *dd = GetDevice(_device);
+  if (dd == nullptr || dd->CreateImageView == nullptr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  VkResult r = dd->CreateImageView(_device, _pCreate, _pAlloc, _pView);
+  if (r == VK_SUCCESS && DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    gViewToImage[*_pView] = _pCreate->image;
+  }
+  return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_DestroyImageView(VkDevice _device,
+    VkImageView _view, const VkAllocationCallbacks *_pAlloc)
+{
+  DeviceData *dd = GetDevice(_device);
+  if (dd == nullptr)
+    return;
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    gViewToImage.erase(_view);
+  }
+  if (dd->DestroyImageView != nullptr)
+    dd->DestroyImageView(_device, _view, _pAlloc);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateFramebuffer(VkDevice _device,
+    const VkFramebufferCreateInfo *_pCreate,
+    const VkAllocationCallbacks *_pAlloc, VkFramebuffer *_pFb)
+{
+  DeviceData *dd = GetDevice(_device);
+  if (dd == nullptr || dd->CreateFramebuffer == nullptr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  VkResult r = dd->CreateFramebuffer(_device, _pCreate, _pAlloc, _pFb);
+  if (r == VK_SUCCESS && DrawTraceEnabled())
+  {
+    FramebufferData fb;
+    fb.views.assign(_pCreate->pAttachments,
+        _pCreate->pAttachments + _pCreate->attachmentCount);
+    bool anySwapchain = false;
+    {
+      std::lock_guard<std::mutex> lk(gMutex);
+      for (VkImageView v : fb.views)
+      {
+        auto it = gViewToImage.find(v);
+        VkImage img = it == gViewToImage.end() ? VK_NULL_HANDLE : it->second;
+        fb.images.push_back(img);
+        if (img != VK_NULL_HANDLE && ImageIsSwapchain(img))
+          anySwapchain = true;
+      }
+      gFramebuffers[*_pFb] = std::move(fb);
+    }
+    if (anySwapchain)
+      TraceLog("CreateFramebuffer %p -> SWAPCHAIN-targeting (%u attachments)",
+          static_cast<void *>(*_pFb), _pCreate->attachmentCount);
+  }
+  return r;
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_DestroyFramebuffer(VkDevice _device,
+    VkFramebuffer _fb, const VkAllocationCallbacks *_pAlloc)
+{
+  DeviceData *dd = GetDevice(_device);
+  if (dd == nullptr)
+    return;
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    gFramebuffers.erase(_fb);
+  }
+  if (dd->DestroyFramebuffer != nullptr)
+    dd->DestroyFramebuffer(_device, _fb, _pAlloc);
+}
+
+// Returns true if `_fb` is a tracked framebuffer that attaches at least one
+// swapchain image.
+bool FramebufferTargetsSwapchain(VkFramebuffer _fb)
+{
+  std::lock_guard<std::mutex> lk(gMutex);
+  auto it = gFramebuffers.find(_fb);
+  if (it == gFramebuffers.end())
+    return false;
+  for (VkImage img : it->second.images)
+  {
+    if (img != VK_NULL_HANDLE && ImageIsSwapchain(img))
+      return true;
+  }
+  return false;
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRenderPass(VkCommandBuffer _cb,
+    const VkRenderPassBeginInfo *_pBegin, VkSubpassContents _contents)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    bool targets = FramebufferTargetsSwapchain(_pBegin->framebuffer);
+    {
+      std::lock_guard<std::mutex> lk(gMutex);
+      auto &st = gCmdBufStates[_cb];
+      st.inSwapchainPass = true;  // we now trace ALL passes
+      st.drawCount = 0u;
+      st.clearCount = 0u;
+      st.bindPipelineCount = 0u;
+      st.bindDescriptorSetsCount = 0u;
+      TraceLog("cb=%p BeginRenderPass fb=%p clearCount=%u render_area=%dx%d "
+               "(%s)",
+          static_cast<void *>(_cb),
+          static_cast<void *>(_pBegin->framebuffer),
+          _pBegin->clearValueCount,
+          _pBegin->renderArea.extent.width, _pBegin->renderArea.extent.height,
+          targets ? "SWAPCHAIN-targeting" : "non-swapchain");
+      for (uint32_t i = 0u; i < _pBegin->clearValueCount && i < 4u; ++i)
+      {
+        const VkClearValue &cv = _pBegin->pClearValues[i];
+        TraceLog("cb=%p   clear[%u] color={%.3f, %.3f, %.3f, %.3f}",
+            static_cast<void *>(_cb), i,
+            cv.color.float32[0], cv.color.float32[1],
+            cv.color.float32[2], cv.color.float32[3]);
+      }
+    }
+  }
+  if (dd != nullptr && dd->CmdBeginRenderPass != nullptr)
+    dd->CmdBeginRenderPass(_cb, _pBegin, _contents);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRenderPass(VkCommandBuffer _cb)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      TraceLog("cb=%p EndRenderPass  binds=%u sets=%u draws=%u clears=%u",
+          static_cast<void *>(_cb), it->second.bindPipelineCount,
+          it->second.bindDescriptorSetsCount, it->second.drawCount,
+          it->second.clearCount);
+      it->second.inSwapchainPass = false;
+    }
+  }
+  if (dd != nullptr && dd->CmdEndRenderPass != nullptr)
+    dd->CmdEndRenderPass(_cb);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRenderPass2(VkCommandBuffer _cb,
+    const VkRenderPassBeginInfo *_pBegin,
+    const VkSubpassBeginInfo *_pSubpass)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    bool targets = FramebufferTargetsSwapchain(_pBegin->framebuffer);
+    if (targets)
+    {
+      std::lock_guard<std::mutex> lk(gMutex);
+      auto &st = gCmdBufStates[_cb];
+      st.inSwapchainPass = true;
+      st.drawCount = 0u;
+      st.clearCount = 0u;
+      st.bindPipelineCount = 0u;
+      st.bindDescriptorSetsCount = 0u;
+      TraceLog("cb=%p BeginRenderPass2 fb=%p (SWAPCHAIN-targeting)",
+          static_cast<void *>(_cb),
+          static_cast<void *>(_pBegin->framebuffer));
+    }
+  }
+  if (dd != nullptr && dd->CmdBeginRenderPass2 != nullptr)
+    dd->CmdBeginRenderPass2(_cb, _pBegin, _pSubpass);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRenderPass2(VkCommandBuffer _cb,
+    const VkSubpassEndInfo *_pSubpass)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      TraceLog("cb=%p EndRenderPass2 binds=%u sets=%u draws=%u clears=%u",
+          static_cast<void *>(_cb), it->second.bindPipelineCount,
+          it->second.bindDescriptorSetsCount, it->second.drawCount,
+          it->second.clearCount);
+      it->second.inSwapchainPass = false;
+    }
+  }
+  if (dd != nullptr && dd->CmdEndRenderPass2 != nullptr)
+    dd->CmdEndRenderPass2(_cb, _pSubpass);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdBindPipeline(VkCommandBuffer _cb,
+    VkPipelineBindPoint _bp, VkPipeline _pipeline)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      ++it->second.bindPipelineCount;
+      TraceLog("cb=%p   BindPipeline bp=%d pipeline=%p",
+          static_cast<void *>(_cb), static_cast<int>(_bp),
+          static_cast<void *>(_pipeline));
+    }
+  }
+  if (dd != nullptr && dd->CmdBindPipeline != nullptr)
+    dd->CmdBindPipeline(_cb, _bp, _pipeline);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdBindDescriptorSets(VkCommandBuffer _cb,
+    VkPipelineBindPoint _bp, VkPipelineLayout _layout, uint32_t _firstSet,
+    uint32_t _setCount, const VkDescriptorSet *_pSets,
+    uint32_t _dynOffsetCount, const uint32_t *_pDynOffsets)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      ++it->second.bindDescriptorSetsCount;
+      TraceLog("cb=%p   BindDescriptorSets first=%u count=%u set0=%p",
+          static_cast<void *>(_cb), _firstSet, _setCount,
+          _setCount > 0u ? static_cast<void *>(_pSets[0]) : nullptr);
+    }
+  }
+  if (dd != nullptr && dd->CmdBindDescriptorSets != nullptr)
+    dd->CmdBindDescriptorSets(_cb, _bp, _layout, _firstSet, _setCount, _pSets,
+        _dynOffsetCount, _pDynOffsets);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdDraw(VkCommandBuffer _cb,
+    uint32_t _vertexCount, uint32_t _instanceCount, uint32_t _firstVertex,
+    uint32_t _firstInstance)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      ++it->second.drawCount;
+      TraceLog("cb=%p   Draw verts=%u inst=%u firstV=%u firstI=%u",
+          static_cast<void *>(_cb), _vertexCount, _instanceCount,
+          _firstVertex, _firstInstance);
+    }
+  }
+  if (dd != nullptr && dd->CmdDraw != nullptr)
+    dd->CmdDraw(_cb, _vertexCount, _instanceCount, _firstVertex,
+        _firstInstance);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdDrawIndexed(VkCommandBuffer _cb,
+    uint32_t _indexCount, uint32_t _instanceCount, uint32_t _firstIndex,
+    int32_t _vertexOffset, uint32_t _firstInstance)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      ++it->second.drawCount;
+      TraceLog("cb=%p   DrawIndexed idx=%u inst=%u firstIdx=%u vtxOff=%d",
+          static_cast<void *>(_cb), _indexCount, _instanceCount, _firstIndex,
+          _vertexOffset);
+    }
+  }
+  if (dd != nullptr && dd->CmdDrawIndexed != nullptr)
+    dd->CmdDrawIndexed(_cb, _indexCount, _instanceCount, _firstIndex,
+        _vertexOffset, _firstInstance);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdClearAttachments(VkCommandBuffer _cb,
+    uint32_t _attachmentCount, const VkClearAttachment *_pAttachments,
+    uint32_t _rectCount, const VkClearRect *_pRects)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      ++it->second.clearCount;
+      TraceLog("cb=%p   ClearAttachments n=%u rects=%u",
+          static_cast<void *>(_cb), _attachmentCount, _rectCount);
+    }
+  }
+  if (dd != nullptr && dd->CmdClearAttachments != nullptr)
+    dd->CmdClearAttachments(_cb, _attachmentCount, _pAttachments, _rectCount,
+        _pRects);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdClearColorImage(VkCommandBuffer _cb,
+    VkImage _image, VkImageLayout _layout, const VkClearColorValue *_pColor,
+    uint32_t _rangeCount, const VkImageSubresourceRange *_pRanges)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    bool isSwapchain = false;
+    {
+      std::lock_guard<std::mutex> lk(gMutex);
+      isSwapchain = ImageIsSwapchain(_image);
+    }
+    if (isSwapchain)
+      TraceLog("cb=%p   CmdClearColorImage SWAPCHAIN img=%p "
+               "color={%.3f,%.3f,%.3f,%.3f}",
+          static_cast<void *>(_cb), static_cast<void *>(_image),
+          _pColor->float32[0], _pColor->float32[1], _pColor->float32[2],
+          _pColor->float32[3]);
+  }
+  if (dd != nullptr && dd->CmdClearColorImage != nullptr)
+    dd->CmdClearColorImage(_cb, _image, _layout, _pColor, _rangeCount,
+        _pRanges);
+}
+
+// ---- Vulkan 1.3 dynamic-rendering ------------------------------------------
+// Qt 6 may use vkCmdBeginRendering instead of classic render passes on
+// drivers that support VK_KHR_dynamic_rendering (NVIDIA 580 does). Without
+// these hooks the render-pass trace shows zero passes -- a critical blind
+// spot.
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdBeginRendering(VkCommandBuffer _cb,
+    const VkRenderingInfo *_pInfo)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    bool targetsSwapchain = false;
+    {
+      std::lock_guard<std::mutex> lk(gMutex);
+      for (uint32_t i = 0u; i < _pInfo->colorAttachmentCount; ++i)
+      {
+        VkImageView v = _pInfo->pColorAttachments[i].imageView;
+        auto it = gViewToImage.find(v);
+        if (it != gViewToImage.end() && ImageIsSwapchain(it->second))
+        {
+          targetsSwapchain = true;
+          break;
+        }
+      }
+      auto &st = gCmdBufStates[_cb];
+      st.inSwapchainPass = true;
+      st.drawCount = 0u;
+      st.clearCount = 0u;
+      st.bindPipelineCount = 0u;
+      st.bindDescriptorSetsCount = 0u;
+    }
+    TraceLog("cb=%p BeginRendering colorAttachments=%u render_area=%dx%d (%s)",
+        static_cast<void *>(_cb), _pInfo->colorAttachmentCount,
+        _pInfo->renderArea.extent.width, _pInfo->renderArea.extent.height,
+        targetsSwapchain ? "SWAPCHAIN-targeting" : "non-swapchain");
+    for (uint32_t i = 0u;
+         i < _pInfo->colorAttachmentCount && i < 4u; ++i)
+    {
+      const VkRenderingAttachmentInfo &a = _pInfo->pColorAttachments[i];
+      TraceLog("cb=%p   color[%u] view=%p loadOp=%d storeOp=%d "
+               "clear={%.3f,%.3f,%.3f,%.3f}",
+          static_cast<void *>(_cb), i, static_cast<void *>(a.imageView),
+          static_cast<int>(a.loadOp), static_cast<int>(a.storeOp),
+          a.clearValue.color.float32[0], a.clearValue.color.float32[1],
+          a.clearValue.color.float32[2], a.clearValue.color.float32[3]);
+    }
+  }
+  if (dd != nullptr && dd->CmdBeginRendering != nullptr)
+    dd->CmdBeginRendering(_cb, _pInfo);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdEndRendering(VkCommandBuffer _cb)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    std::lock_guard<std::mutex> lk(gMutex);
+    auto it = gCmdBufStates.find(_cb);
+    if (it != gCmdBufStates.end() && it->second.inSwapchainPass)
+    {
+      TraceLog("cb=%p EndRendering   binds=%u sets=%u draws=%u clears=%u",
+          static_cast<void *>(_cb), it->second.bindPipelineCount,
+          it->second.bindDescriptorSetsCount, it->second.drawCount,
+          it->second.clearCount);
+      it->second.inSwapchainPass = false;
+    }
+  }
+  if (dd != nullptr && dd->CmdEndRendering != nullptr)
+    dd->CmdEndRendering(_cb);
+}
+
+// ---- Non-renderpass image ops ----------------------------------------------
+// These are how Qt could populate the swapchain without ever calling
+// vkCmdDraw: blit / copy an offscreen FBO into the swapchain image directly.
+// Also useful for spotting where grabWindow's QImage is fed from (the
+// fromNative VkImage is read out via vkCmdCopyImageToBuffer if so).
+
+const char *ImgDesc(VkImage _img)
+{
+  std::lock_guard<std::mutex> lk(gMutex);
+  if (ImageIsSwapchain(_img))
+    return "SWAPCHAIN";
+  return "non-swapchain";
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdCopyImage(VkCommandBuffer _cb,
+    VkImage _src, VkImageLayout _srcLayout, VkImage _dst,
+    VkImageLayout _dstLayout, uint32_t _regionCount,
+    const VkImageCopy *_pRegions)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+    TraceLog("cb=%p CmdCopyImage src=%p[%s] -> dst=%p[%s] regions=%u",
+        static_cast<void *>(_cb), static_cast<void *>(_src), ImgDesc(_src),
+        static_cast<void *>(_dst), ImgDesc(_dst), _regionCount);
+  if (dd != nullptr && dd->CmdCopyImage != nullptr)
+    dd->CmdCopyImage(_cb, _src, _srcLayout, _dst, _dstLayout, _regionCount,
+        _pRegions);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdBlitImage(VkCommandBuffer _cb,
+    VkImage _src, VkImageLayout _srcLayout, VkImage _dst,
+    VkImageLayout _dstLayout, uint32_t _regionCount,
+    const VkImageBlit *_pRegions, VkFilter _filter)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+    TraceLog("cb=%p CmdBlitImage src=%p[%s] -> dst=%p[%s] regions=%u "
+             "filter=%d",
+        static_cast<void *>(_cb), static_cast<void *>(_src), ImgDesc(_src),
+        static_cast<void *>(_dst), ImgDesc(_dst), _regionCount,
+        static_cast<int>(_filter));
+  if (dd != nullptr && dd->CmdBlitImage != nullptr)
+    dd->CmdBlitImage(_cb, _src, _srcLayout, _dst, _dstLayout, _regionCount,
+        _pRegions, _filter);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdResolveImage(VkCommandBuffer _cb,
+    VkImage _src, VkImageLayout _srcLayout, VkImage _dst,
+    VkImageLayout _dstLayout, uint32_t _regionCount,
+    const VkImageResolve *_pRegions)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+    TraceLog("cb=%p CmdResolveImage src=%p[%s] -> dst=%p[%s] regions=%u",
+        static_cast<void *>(_cb), static_cast<void *>(_src), ImgDesc(_src),
+        static_cast<void *>(_dst), ImgDesc(_dst), _regionCount);
+  if (dd != nullptr && dd->CmdResolveImage != nullptr)
+    dd->CmdResolveImage(_cb, _src, _srcLayout, _dst, _dstLayout, _regionCount,
+        _pRegions);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdCopyImageToBufferTrace(VkCommandBuffer _cb,
+    VkImage _src, VkImageLayout _srcLayout, VkBuffer _dst, uint32_t _regions,
+    const VkBufferImageCopy *_pRegions)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+    TraceLog("cb=%p CmdCopyImageToBuffer src=%p[%s] -> buf=%p regions=%u",
+        static_cast<void *>(_cb), static_cast<void *>(_src), ImgDesc(_src),
+        static_cast<void *>(_dst), _regions);
+  if (dd != nullptr && dd->CmdCopyImageToBuffer != nullptr)
+    dd->CmdCopyImageToBuffer(_cb, _src, _srcLayout, _dst, _regions, _pRegions);
+}
+
+// ---------------------------------------------------------------------------
 // Instance / Device chain init
 // ---------------------------------------------------------------------------
 
@@ -795,6 +1353,25 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice _phys,
   LOAD_DEV(WaitForFences);
   LOAD_DEV(ResetFences);
   LOAD_DEV(QueueSubmit);
+  LOAD_DEV(CreateImageView);
+  LOAD_DEV(DestroyImageView);
+  LOAD_DEV(CreateFramebuffer);
+  LOAD_DEV(DestroyFramebuffer);
+  LOAD_DEV(CmdBeginRenderPass);
+  LOAD_DEV(CmdEndRenderPass);
+  LOAD_DEV(CmdBeginRenderPass2);
+  LOAD_DEV(CmdEndRenderPass2);
+  LOAD_DEV(CmdBindPipeline);
+  LOAD_DEV(CmdBindDescriptorSets);
+  LOAD_DEV(CmdDraw);
+  LOAD_DEV(CmdDrawIndexed);
+  LOAD_DEV(CmdClearAttachments);
+  LOAD_DEV(CmdClearColorImage);
+  LOAD_DEV(CmdBeginRendering);
+  LOAD_DEV(CmdEndRendering);
+  LOAD_DEV(CmdCopyImage);
+  LOAD_DEV(CmdBlitImage);
+  LOAD_DEV(CmdResolveImage);
 #undef LOAD_DEV
 
   if (id->GetPhysicalDeviceMemoryProperties != nullptr)
@@ -941,6 +1518,38 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_GetDeviceProcAddr(
   INTERCEPT(DestroySwapchainKHR);
   INTERCEPT(GetSwapchainImagesKHR);
   INTERCEPT(QueuePresentKHR);
+  INTERCEPT(CreateImageView);
+  INTERCEPT(DestroyImageView);
+  INTERCEPT(CreateFramebuffer);
+  INTERCEPT(DestroyFramebuffer);
+  INTERCEPT(CmdBeginRenderPass);
+  INTERCEPT(CmdEndRenderPass);
+  INTERCEPT(CmdBeginRenderPass2);
+  INTERCEPT(CmdEndRenderPass2);
+  INTERCEPT(CmdBindPipeline);
+  INTERCEPT(CmdBindDescriptorSets);
+  INTERCEPT(CmdDraw);
+  INTERCEPT(CmdDrawIndexed);
+  INTERCEPT(CmdClearAttachments);
+  INTERCEPT(CmdClearColorImage);
+  INTERCEPT(CmdBeginRendering);
+  INTERCEPT(CmdEndRendering);
+  INTERCEPT(CmdCopyImage);
+  INTERCEPT(CmdBlitImage);
+  INTERCEPT(CmdResolveImage);
+  // vkCmdCopyImageToBuffer needs special handling: the dump submit calls
+  // dd->CmdCopyImageToBuffer (the next-layer pointer) directly, but we DO
+  // want application calls to land in our trace hook. Map the public symbol
+  // to Layer_CmdCopyImageToBufferTrace.
+  if (std::strcmp(_pName, "vkCmdCopyImageToBuffer") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(
+        Layer_CmdCopyImageToBufferTrace);
+  // Dynamic-rendering KHR aliases: the loader routes vkCmdBeginRenderingKHR
+  // through the same layer, so accept both names.
+  if (std::strcmp(_pName, "vkCmdBeginRenderingKHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(Layer_CmdBeginRendering);
+  if (std::strcmp(_pName, "vkCmdEndRenderingKHR") == 0)
+    return reinterpret_cast<PFN_vkVoidFunction>(Layer_CmdEndRendering);
   if (_device == VK_NULL_HANDLE)
     return nullptr;
   DeviceData *dd = GetDevice(_device);
