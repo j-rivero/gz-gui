@@ -44,6 +44,20 @@
 //   on its own; only when the VkImage was created on (and exported by) a
 //   SECOND VkDevice does the QSGSimpleTextureNode draw render uniform.
 //
+// IMPORTANT CAVEAT (recorded 2026-05-30): Tests 1-4 all PASS but their
+// assertion is on QQuickWindow::grabWindow() output, not on the actual
+// swapchain presentation. A subsequent Xvfb screen capture of the live
+// O3DE demo confirmed the production symptom (uniform 148 = Atom's
+// background-clear colour), while the same demo's consumer-side dumps
+// (transfer-copy + sampler probe) show the producer's correct shapes.
+// An Xvfb capture of Test 3's passing run shows a pure 64x64 white block
+// where the pattern should be. So grabWindow() and the presented framebuffer
+// diverge -- the QSGSimpleTextureNode draw apparently goes through one path
+// for grabWindow's readback and another for swapchain present, and the
+// production bug lives on the latter. A follow-up test variant needs to
+// verify against an on-screen capture (e.g. Xvfb root grab) rather than
+// grabWindow(), to actually exercise the failing path.
+//
 // Test 3 (FromNativeRendersImportedFdPattern) -- PASSES today:
 //   The closest possible test-level analog to the production O3DE setup.
 //   A second, private VkInstance/VkDevice stands in for Atom: it creates
@@ -918,11 +932,32 @@ void AssertRenderedPattern(const QImage &_rendered, const char *_caseLabel)
 // QQuickItem mirroring MinimalSceneRhiVulkan's role: on updatePaintNode it
 // creates a QSGSimpleTextureNode wrapping the externally-owned VkImage via
 // QSGVulkanTexture::fromNative. This is the EXACT path under test.
+//
+// Two size knobs:
+//   * vkImageSize     -- the actual VkImage::extent (passed to vkCreateImage).
+//   * fromNativeSize  -- the size we tell QSGVulkanTexture::fromNative.
+// In Tests 1-3 the two match (the test creates the image at kPatternW x
+// kPatternH and passes the same to fromNative). Test 4 deliberately
+// mismatches them, mirroring the production O3DE setup where the consumer
+// reports the camera's window size (e.g. 1024x670) to fromNative while the
+// producer's exported VkImage is still at its initial size (e.g. 512x512).
+//
+// Texture-lifecycle knob (production-flavour):
+//   * recreateEveryFrame -- when true, replicates MinimalSceneRhi
+//                           Vulkan's pattern of `delete this->texture;
+//                           this->texture = fromNative(...);` on every
+//                           PrepareNode -- i.e. a NEW QSGVulkanTexture each
+//                           frame, wrapping the SAME VkImage handle. Tests
+//                           the hypothesis that rapidly-replaced fromNative
+//                           wrappers (aliasing one VkImage) confuse Qt's
+//                           QSGSimpleTextureNode draw.
 class PatternItem : public QQuickItem
 {
  public:
-  PatternItem(QQuickItem *_parent, VkImage _image, QSize _size)
-      : QQuickItem(_parent), image(_image), size(_size)
+  PatternItem(QQuickItem *_parent, VkImage _image, QSize _fromNativeSize,
+      bool _recreateEveryFrame = false)
+      : QQuickItem(_parent), image(_image), fromNativeSize(_fromNativeSize),
+        recreateEveryFrame(_recreateEveryFrame)
   {
     this->setFlag(ItemHasContents);
   }
@@ -934,24 +969,38 @@ class PatternItem : public QQuickItem
     if (node == nullptr)
     {
       node = new QSGSimpleTextureNode();
-      // This is the call path being debugged. fromNative is documented to wrap
-      // an externally-created VkImage in its current layout; the consumer
-      // (this node) does not transition it.
-      // https://doc.qt.io/qt-6/qsgvulkantexture.html
-      QSGTexture *tex =
-          QNativeInterface::QSGVulkanTexture::fromNative(this->image,
-              VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-              this->window(), this->size);
-      node->setTexture(tex);
-      node->setOwnsTexture(true);
+      this->WrapAndSet(node);
+    }
+    else if (this->recreateEveryFrame)
+    {
+      // Mirror what MinimalSceneRhiVulkan::CreateTexture does every frame:
+      // delete the previous QSGVulkanTexture wrapper, allocate a new one
+      // around the same VkImage handle, install on the node, mark dirty.
+      this->WrapAndSet(node);
+      node->markDirty(QSGNode::DirtyMaterial);
     }
     node->setRect(this->boundingRect());
     return node;
   }
 
  private:
+  void WrapAndSet(QSGSimpleTextureNode *_node)
+  {
+    // fromNative is documented to wrap an externally-created VkImage in its
+    // current layout; the consumer does not transition it. The size param
+    // is documented as the texture's pixel dimensions.
+    // https://doc.qt.io/qt-6/qsgvulkantexture.html
+    QSGTexture *tex =
+        QNativeInterface::QSGVulkanTexture::fromNative(this->image,
+            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            this->window(), this->fromNativeSize);
+    _node->setTexture(tex);
+    _node->setOwnsTexture(true);
+  }
+
   VkImage image{VK_NULL_HANDLE};
-  QSize size;
+  QSize fromNativeSize;
+  bool recreateEveryFrame{false};
 };
 }  // namespace
 
@@ -1187,6 +1236,92 @@ TEST(QsgSimpleTextureNodeVulkan,
   vkDestroyImage(qt.device, importedImage, nullptr);
   vkFreeMemory(qt.device, importedMem, nullptr);
 }
+
+/////////////////////////////////////////////////
+// Test 4: replicate MinimalSceneRhiVulkan's "new fromNative wrapper every
+// frame" lifecycle, on the same kind of VkImage Test 2 used.
+//
+// Layered diagnostics in the live demo showed:
+//   * handles thread correctly through the pipeline (Atom's exported VkImage
+//     == Qt-side imported VkImage == handle Qt wraps via fromNative);
+//   * the imported image's content is correct (the transfer-copy and the
+//     compute-shader sampler probe both read the producer's shapes byte-
+//     identically: 67 unique colours);
+//   * yet the screen renders uniform 148 (Atom's clear colour);
+//   * fromNative is called repeatedly on the same VkImage handle as the
+//     window resizes (size=0x0 then 1024x1024 then 1024x670 -- one new
+//     fromNative wrapper per CreateTexture invocation), and even at steady
+//     state CreateTexture fires every frame for a new wrapper around the
+//     same VkImage. Both Tests 1-3 use a stable wrapper (fromNative is
+//     called once in updatePaintNode's first call, then the cached node is
+//     returned), so they do not exercise that lifecycle.
+//
+// This test layers the production "new fromNative wrapper every frame"
+// lifecycle on top of Test 2's working single-device OPTIMAL setup.
+// Result: PASSES (against grabWindow()), so the rapid-wrapper-replacement
+// is harmless to grabWindow's readback path -- but see the file-header
+// caveat: the bug is on the swapchain-present path, which grabWindow()
+// does not exercise. A future variant should verify against Xvfb-root
+// capture instead.
+TEST(QsgSimpleTextureNodeVulkan,
+    GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRecreatedEveryFrame))
+{
+  QQuickWindow::setGraphicsApi(QSGRendererInterface::Vulkan);
+  int argc = 1;
+  static char argv0[] = "qsg_simple_texture_node_vulkan_size_mismatch";
+  static char *argv[] = {argv0, nullptr};
+  QGuiApplication app(argc, argv);
+
+  QQuickView view;
+  view.setResizeMode(QQuickView::SizeRootObjectToView);
+  view.resize(kPatternW, kPatternH);
+  view.show();
+  QTest::qWaitForWindowExposed(&view);
+  QCoreApplication::processEvents();
+
+  PatternImage pi;
+  ASSERT_TRUE(GetQtVulkanHandles(&view, &pi));
+  QSGRendererInterface *rif = view.rendererInterface();
+  VkQueue queue = *static_cast<VkQueue *>(rif->getResource(&view,
+      QSGRendererInterface::CommandQueueResource));
+  ASSERT_NE(queue, VK_NULL_HANDLE);
+  uint32_t qfCount = 0u;
+  vkGetPhysicalDeviceQueueFamilyProperties(pi.physicalDevice, &qfCount, nullptr);
+  std::vector<VkQueueFamilyProperties> qfs(qfCount);
+  vkGetPhysicalDeviceQueueFamilyProperties(pi.physicalDevice, &qfCount,
+      qfs.data());
+  uint32_t queueFamily = UINT32_MAX;
+  for (uint32_t i = 0u; i < qfCount; ++i)
+  {
+    if (qfs[i].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+    {
+      queueFamily = i;
+      break;
+    }
+  }
+  ASSERT_NE(queueFamily, UINT32_MAX);
+  ASSERT_TRUE(CreateOptimalPatternImage(queue, queueFamily, &pi));
+
+  // Same setup as Test 2 (single-device OPTIMAL + staging upload), with the
+  // recreate-every-frame texture lifecycle layered on top.
+  auto *parent = view.contentItem();
+  ASSERT_NE(parent, nullptr);
+  auto *item = new PatternItem(parent, pi.image,
+      QSize(kPatternW, kPatternH), /* recreateEveryFrame */ true);
+  item->setSize(QSizeF(kPatternW, kPatternH));
+  item->setPosition(QPointF(0.0, 0.0));
+
+  // Force a handful of frames so updatePaintNode runs the recreate path
+  // several times (the production lifecycle fires CreateTexture every frame).
+  for (int i = 0; i < 8; ++i)
+  {
+    view.update();
+    QCoreApplication::processEvents();
+  }
+  QImage rendered = view.grabWindow();
+  AssertRenderedPattern(rendered, "OPTIMAL/fromNative-recreated-every-frame");
+  view.close();
+}
 #else  // GZ_GUI_TEST_HAVE_VULKAN
 TEST(QsgSimpleTextureNodeVulkan,
     GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRendersLinearPattern))
@@ -1202,6 +1337,12 @@ TEST(QsgSimpleTextureNodeVulkan,
 }
 TEST(QsgSimpleTextureNodeVulkan,
     GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRendersImportedFdPattern))
+{
+  GTEST_SKIP() << "Qt was built without Vulkan support; "
+                  "QSGVulkanTexture::fromNative is not available.";
+}
+TEST(QsgSimpleTextureNodeVulkan,
+    GZ_UTILS_TEST_ENABLED_ONLY_ON_LINUX(FromNativeRecreatedEveryFrame))
 {
   GTEST_SKIP() << "Qt was built without Vulkan support; "
                   "QSGVulkanTexture::fromNative is not available.";
