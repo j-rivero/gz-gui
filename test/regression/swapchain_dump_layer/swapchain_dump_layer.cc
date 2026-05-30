@@ -153,6 +153,10 @@ struct DeviceData
   PFN_vkCmdCopyImage CmdCopyImage{nullptr};
   PFN_vkCmdBlitImage CmdBlitImage{nullptr};
   PFN_vkCmdResolveImage CmdResolveImage{nullptr};
+  PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage{nullptr};
+  PFN_vkCmdDispatch CmdDispatch{nullptr};
+  PFN_vkCmdDispatchIndirect CmdDispatchIndirect{nullptr};
+  PFN_vkCmdDispatchBase CmdDispatchBase{nullptr};
   PFN_vkUpdateDescriptorSets UpdateDescriptorSets{nullptr};
 
   VkPhysicalDeviceMemoryProperties memProps{};
@@ -1292,6 +1296,108 @@ VKAPI_ATTR void VKAPI_CALL Layer_CmdResolveImage(VkCommandBuffer _cb,
         _pRegions);
 }
 
+// vkCmdCopyBufferToImage -- the "render text/chrome into a CPU buffer then
+// upload" path Qt 6 QSG can use to fill swapchain regions without a draw call.
+// Empirically, the gz-gui live demo's swapchain ends up with chrome + viewport
+// content even though no draws target the SWAPCHAIN-targeting framebuffers --
+// this is the prime suspect for the missing write.
+VKAPI_ATTR void VKAPI_CALL Layer_CmdCopyBufferToImage(VkCommandBuffer _cb,
+    VkBuffer _srcBuffer, VkImage _dstImage, VkImageLayout _dstLayout,
+    uint32_t _regionCount, const VkBufferImageCopy *_pRegions)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+    TraceLog("cb=%p CmdCopyBufferToImage src_buf=%p -> dst=%p[%s] regions=%u "
+             "dst_layout=%d",
+        static_cast<void *>(_cb), static_cast<void *>(_srcBuffer),
+        static_cast<void *>(_dstImage), ImgDesc(_dstImage), _regionCount,
+        static_cast<int>(_dstLayout));
+  if (dd != nullptr && dd->CmdCopyBufferToImage != nullptr)
+    dd->CmdCopyBufferToImage(_cb, _srcBuffer, _dstImage, _dstLayout,
+        _regionCount, _pRegions);
+}
+
+// vkCmdDispatch -- compute shader. A compute pass with a STORAGE_IMAGE
+// descriptor write to one of the swapchain images would explain the missing
+// content. We don't know image bindings here without doing the descriptor-
+// set expansion the bind hook already does; emit a similar expansion so the
+// dispatch's storage-image targets are nameable.
+void TraceDispatchBindings(VkCommandBuffer _cb)
+{
+  // Re-use the same lock as descriptor-set tracking; the call site already
+  // holds the trace gate.
+  std::lock_guard<std::mutex> lk(gMutex);
+  // The layer doesn't track per-cb current descriptor sets (that would be a
+  // larger refactor), so we just dump every set that has any STORAGE_IMAGE
+  // binding the swapchain knows about, leaving attribution to the human eye.
+  for (auto &kv : gDescriptorImageMap)
+  {
+    for (auto &kv2 : kv.second)
+    {
+      const DescriptorImageBinding &b = kv2.second;
+      if (b.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_IMAGE)
+        continue;
+      VkImage img = VK_NULL_HANDLE;
+      auto vit = gViewToImage.find(b.view);
+      if (vit != gViewToImage.end())
+        img = vit->second;
+      if (img == VK_NULL_HANDLE || !ImageIsSwapchain(img))
+        continue;
+      const uint32_t binding = kv2.first / 1024u;
+      const uint32_t elem = kv2.first % 1024u;
+      TraceLog("cb=%p   dispatch-time: set=%p binding=%u elem=%u "
+               "view=%p image=%p[SWAPCHAIN] layout=%d (STORAGE_IMAGE)",
+          static_cast<void *>(_cb), static_cast<void *>(kv.first),
+          binding, elem, static_cast<void *>(b.view),
+          static_cast<void *>(img), static_cast<int>(b.layout));
+    }
+  }
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdDispatch(VkCommandBuffer _cb,
+    uint32_t _gx, uint32_t _gy, uint32_t _gz)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    TraceLog("cb=%p CmdDispatch groups=(%u, %u, %u)",
+        static_cast<void *>(_cb), _gx, _gy, _gz);
+    TraceDispatchBindings(_cb);
+  }
+  if (dd != nullptr && dd->CmdDispatch != nullptr)
+    dd->CmdDispatch(_cb, _gx, _gy, _gz);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdDispatchIndirect(VkCommandBuffer _cb,
+    VkBuffer _buffer, VkDeviceSize _offset)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    TraceLog("cb=%p CmdDispatchIndirect buf=%p offset=%llu",
+        static_cast<void *>(_cb), static_cast<void *>(_buffer),
+        static_cast<unsigned long long>(_offset));
+    TraceDispatchBindings(_cb);
+  }
+  if (dd != nullptr && dd->CmdDispatchIndirect != nullptr)
+    dd->CmdDispatchIndirect(_cb, _buffer, _offset);
+}
+
+VKAPI_ATTR void VKAPI_CALL Layer_CmdDispatchBase(VkCommandBuffer _cb,
+    uint32_t _bx, uint32_t _by, uint32_t _bz,
+    uint32_t _gx, uint32_t _gy, uint32_t _gz)
+{
+  DeviceData *dd = GetDeviceByQueue(reinterpret_cast<VkQueue>(_cb));
+  if (DrawTraceEnabled())
+  {
+    TraceLog("cb=%p CmdDispatchBase base=(%u, %u, %u) groups=(%u, %u, %u)",
+        static_cast<void *>(_cb), _bx, _by, _bz, _gx, _gy, _gz);
+    TraceDispatchBindings(_cb);
+  }
+  if (dd != nullptr && dd->CmdDispatchBase != nullptr)
+    dd->CmdDispatchBase(_cb, _bx, _by, _bz, _gx, _gy, _gz);
+}
+
 // ---- Descriptor-set image binding tracking ---------------------------------
 // At vkUpdateDescriptorSets time, recognise writes whose descriptorType binds
 // an image (combined image sampler, sampled image, storage image, input
@@ -1469,6 +1575,10 @@ VKAPI_ATTR VkResult VKAPI_CALL Layer_CreateDevice(VkPhysicalDevice _phys,
   LOAD_DEV(CmdCopyImage);
   LOAD_DEV(CmdBlitImage);
   LOAD_DEV(CmdResolveImage);
+  LOAD_DEV(CmdCopyBufferToImage);
+  LOAD_DEV(CmdDispatch);
+  LOAD_DEV(CmdDispatchIndirect);
+  LOAD_DEV(CmdDispatchBase);
   LOAD_DEV(UpdateDescriptorSets);
 #undef LOAD_DEV
 
@@ -1635,6 +1745,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL Layer_GetDeviceProcAddr(
   INTERCEPT(CmdCopyImage);
   INTERCEPT(CmdBlitImage);
   INTERCEPT(CmdResolveImage);
+  INTERCEPT(CmdCopyBufferToImage);
+  INTERCEPT(CmdDispatch);
+  INTERCEPT(CmdDispatchIndirect);
+  INTERCEPT(CmdDispatchBase);
   INTERCEPT(UpdateDescriptorSets);
   // vkCmdCopyImageToBuffer needs special handling: the dump submit calls
   // dd->CmdCopyImageToBuffer (the next-layer pointer) directly, but we DO
